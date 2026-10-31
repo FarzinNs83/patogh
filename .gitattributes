@@ -1,0 +1,5 @@
+# Shell scripts and the nginx template run on Linux (in Docker or on the
+# server). Keep them LF even in a Windows checkout with core.autocrlf, or they
+# fail with "/bin/sh^M: bad interpreter".
+*.sh text eol=lf
+nginx/*.template text eol=lf

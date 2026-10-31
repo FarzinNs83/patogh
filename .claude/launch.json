@@ -1,0 +1,24 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "livekit",
+      "runtimeExecutable": "tools/livekit/livekit-server.exe",
+      "runtimeArgs": ["--config", "tools/livekit/livekit.yaml"],
+      "port": 7880
+    },
+    {
+      "name": "patogh-server",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev:server"],
+      "port": 3005
+    },
+    {
+      "name": "patogh-web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["exec", "-w", "@patogh/web", "--", "vite", "--host", "127.0.0.1"],
+      "port": 5173,
+      "url": "http://127.0.0.1:5173"
+    }
+  ]
+}

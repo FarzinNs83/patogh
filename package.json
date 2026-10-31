@@ -1,0 +1,69 @@
+{
+  "name": "patogh",
+  "version": "1.11.0",
+  "private": true,
+  "description": "Open, self-hosted communication platform — text, voice, video, and federation",
+  "author": "Farzin Nasiri",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:server": "npm run dev -w @patogh/server",
+    "dev:web": "npm run dev -w @patogh/web",
+    "dev": "node scripts/dev.mjs",
+    "build:shared": "npm run build -w @patogh/shared",
+    "build:server": "npm run build -w @patogh/server",
+    "build:web": "npm run build -w @patogh/web",
+    "build": "npm run build -w @patogh/shared && npm run build -w @patogh/server && npm run build -w @patogh/web",
+    "typecheck": "npm run build -w @patogh/shared && npm run typecheck --workspaces --if-present && node scripts/check-i18n.mjs",
+    "check:i18n": "node scripts/check-i18n.mjs",
+    "lint": "eslint . --max-warnings 0",
+    "lint:suppress": "eslint . --suppress-all",
+    "lint:prune": "eslint . --prune-suppressions",
+    "test": "npm test --workspaces --if-present",
+    "dev:desktop": "npm run dev -w @patogh/desktop",
+    "build:desktop": "npm run build -w @patogh/desktop",
+    "gen-icons": "node scripts/gen-icons.mjs",
+    "bump": "node scripts/bump-version.mjs"
+  },
+  "devDependencies": {
+    "eslint": "^10.11.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "png-to-ico": "^3.0.2",
+    "png2icons": "^2.0.1",
+    "sharp": "^0.35.5",
+    "typescript-eslint": "^8.70.1"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "overrides": {
+    "dbus-next": {
+      "xml2js": "^0.6.2"
+    },
+    "undici@^6": "^6.28.1",
+    "undici@^7": "^7.29.1",
+    "fast-uri@^2": "^2.4.7",
+    "fast-uri@^3": "^3.1.8",
+    "minimatch@^9": "^9.0.7",
+    "brace-expansion@^1": "^1.1.21",
+    "brace-expansion@^2": "^2.1.7",
+    "brace-expansion@^5": "^5.0.12",
+    "js-yaml@^4": "^4.3.1",
+    "@xmldom/xmldom@^0.8": "^0.8.15",
+    "form-data@^4": "^4.0.6",
+    "tmp@^0.2": "^0.2.6",
+    "picomatch@^2": "^2.3.2",
+    "picomatch@^4": "^4.0.4",
+    "postcss-selector-parser@^6": "^6.1.3",
+    "sharp@^0.35": "^0.35.5",
+    "@fastify/busboy@^3": "^3.2.2",
+    "proxy-addr@^2": "^2.0.8",
+    "http-cache-semantics@^4": "^4.3.0",
+    "source-map-js@^1": "^1.2.2",
+    "lodash@^4": "^4.18.0"
+  },
+  "allowScripts": {
+    "esbuild": true
+  }
+}
