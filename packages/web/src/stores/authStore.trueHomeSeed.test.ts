@@ -1,0 +1,247 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { User } from '@patogh/shared';
+
+vi.mock('../audio/AudioManager', () => ({
+  AudioManager: { getInstance: vi.fn().mockReturnValue({ setOutputDevice: vi.fn(), setVolume: vi.fn() }) },
+}));
+vi.mock('../hooks/useWebSocket', () => ({
+  connectInstance: vi.fn(),
+  disconnectInstance: vi.fn(),
+  disconnectAllRemote: vi.fn(),
+}));
+
+import { selectMyChosenStatus, useAuthStore, TRUE_HOME_STATUS_MAX_AGE_MS } from './authStore';
+import { useInstanceStore } from './instanceStore';
+import { api } from '../api/client';
+
+function user(fields: Partial<User> & Pick<User, 'id'>): User {
+  return {
+    username: fields.id, displayName: null, avatar: null, banner: null, accentColor: null, avatarColor: null,
+    bio: null, status: 'online', customStatus: null, isAdmin: false, createdAt: 1, homeInstance: null,
+    homeUserId: null, replicatedInstances: [], ...fields,
+  } as User;
+}
+
+/** erin@nova signed in directly on this page's instance: a replicated row. */
+const erinHere = user({ id: 'erin-here', homeInstance: 'nova.example', homeUserId: 'erin-nova' });
+/** Another row on this page's instance with the same home identity (same origin, so the same storage). */
+const erinElsewhere = user({ id: 'erin-elsewhere', homeInstance: 'nova.example', homeUserId: 'erin-nova' });
+/** A different nova account signed in on this page's instance. */
+const tomHere = user({ id: 'tom-here', homeInstance: 'nova.example', homeUserId: 'tom-nova' });
+
+/** A page load: the in-memory store starts empty, localStorage survives. */
+function reload(): void {
+  useAuthStore.setState({ token: 'page-token', user: null, trueHomeStatus: null });
+}
+
+beforeEach(() => {
+  localStorage.clear();
+  vi.spyOn(useInstanceStore.getState(), 'autoConnectAll').mockResolvedValue(undefined);
+});
+
+afterEach(() => {
+  useAuthStore.setState({ token: null, user: null, trueHomeStatus: null });
+  localStorage.clear();
+  vi.restoreAllMocks();
+});
+
+describe("a replicated session's chosen status before the true home reports", () => {
+  it('starts from the last status the true home reported, after a page load', async () => {
+    useAuthStore.setState({ user: erinHere });
+    useAuthStore.getState().applyOwnStatus({ owner: 'trueHome', status: 'dnd' });
+
+    reload();
+    vi.spyOn(api.users, 'me').mockResolvedValue(erinHere);
+    await useAuthStore.getState().loadUser();
+
+    expect(selectMyChosenStatus(useAuthStore.getState())).toBe('dnd');
+  });
+
+  it('starts from it on a fresh sign-in on the same origin with the same home identity', () => {
+    useAuthStore.setState({ user: erinHere });
+    useAuthStore.getState().applyOwnStatus({ owner: 'trueHome', status: 'idle' });
+
+    reload();
+    useAuthStore.getState().initSession('new-token', erinElsewhere);
+
+    expect(selectMyChosenStatus(useAuthStore.getState())).toBe('idle');
+  });
+
+  it("never takes another account's last status", () => {
+    useAuthStore.setState({ user: erinHere });
+    useAuthStore.getState().applyOwnStatus({ owner: 'trueHome', status: 'dnd' });
+
+    reload();
+    useAuthStore.getState().initSession('new-token', tomHere);
+
+    expect(selectMyChosenStatus(useAuthStore.getState())).toBeNull();
+  });
+
+  it("gives way to the true home's next report", async () => {
+    useAuthStore.setState({ user: erinHere });
+    useAuthStore.getState().applyOwnStatus({ owner: 'trueHome', status: 'dnd' });
+
+    reload();
+    vi.spyOn(api.users, 'me').mockResolvedValue(erinHere);
+    await useAuthStore.getState().loadUser();
+    useAuthStore.getState().applyOwnStatus({ owner: 'trueHome', status: 'online' });
+
+    expect(selectMyChosenStatus(useAuthStore.getState())).toBe('online');
+  });
+
+  it('is unknown when nothing was ever reported on this device', async () => {
+    reload();
+    vi.spyOn(api.users, 'me').mockResolvedValue(erinHere);
+    await useAuthStore.getState().loadUser();
+
+    expect(selectMyChosenStatus(useAuthStore.getState())).toBeNull();
+  });
+
+  it('is unknown, without failing, when storage cannot be read', async () => {
+    useAuthStore.setState({ user: erinHere });
+    useAuthStore.getState().applyOwnStatus({ owner: 'trueHome', status: 'dnd' });
+
+    reload();
+    vi.spyOn(localStorage, 'getItem').mockImplementation(() => { throw new Error('blocked'); });
+    vi.spyOn(api.users, 'me').mockResolvedValue(erinHere);
+    await useAuthStore.getState().loadUser();
+
+    expect(selectMyChosenStatus(useAuthStore.getState())).toBeNull();
+  });
+
+  it('keeps a native session on its own status, which the cache never touches', () => {
+    const jannis = user({ id: 'jannis', status: 'idle' });
+    useAuthStore.getState().initSession('new-token', jannis);
+
+    expect(useAuthStore.getState().trueHomeStatus).toBeNull();
+    expect(selectMyChosenStatus(useAuthStore.getState())).toBe('idle');
+  });
+
+  it('stops standing in for the true home once it is older than the maximum age (#325)', async () => {
+    const reportedAt = new Date('2026-09-28T08:00:00Z').getTime();
+    vi.useFakeTimers({ now: reportedAt, toFake: ['Date'] });
+    try {
+      useAuthStore.setState({ user: erinHere });
+      useAuthStore.getState().applyOwnStatus({ owner: 'trueHome', status: 'dnd' });
+
+      vi.setSystemTime(reportedAt + TRUE_HOME_STATUS_MAX_AGE_MS + 1);
+      reload();
+      vi.spyOn(api.users, 'me').mockResolvedValue(erinHere);
+      await useAuthStore.getState().loadUser();
+
+      expect(selectMyChosenStatus(useAuthStore.getState())).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('still stands in just before the maximum age', async () => {
+    const reportedAt = new Date('2026-09-28T08:00:00Z').getTime();
+    vi.useFakeTimers({ now: reportedAt, toFake: ['Date'] });
+    try {
+      useAuthStore.setState({ user: erinHere });
+      useAuthStore.getState().applyOwnStatus({ owner: 'trueHome', status: 'dnd' });
+
+      vi.setSystemTime(reportedAt + TRUE_HOME_STATUS_MAX_AGE_MS - 1);
+      reload();
+      vi.spyOn(api.users, 'me').mockResolvedValue(erinHere);
+      await useAuthStore.getState().loadUser();
+
+      expect(selectMyChosenStatus(useAuthStore.getState())).toBe('dnd');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stops standing in once it reaches the maximum age while the page stays open (#325)', async () => {
+    const reportedAt = new Date('2026-09-28T08:00:00Z').getTime();
+    vi.useFakeTimers({ now: reportedAt });
+    try {
+      useAuthStore.setState({ user: erinHere });
+      useAuthStore.getState().applyOwnStatus({ owner: 'trueHome', status: 'dnd' });
+
+      vi.setSystemTime(reportedAt + TRUE_HOME_STATUS_MAX_AGE_MS - 60 * 60 * 1000);
+      reload();
+      vi.spyOn(api.users, 'me').mockResolvedValue(erinHere);
+      await useAuthStore.getState().loadUser();
+      expect(selectMyChosenStatus(useAuthStore.getState())).toBe('dnd');
+
+      vi.advanceTimersByTime(60 * 60 * 1000);
+      expect(selectMyChosenStatus(useAuthStore.getState())).toBe('dnd');
+
+      vi.advanceTimersByTime(1);
+      expect(selectMyChosenStatus(useAuthStore.getState())).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('expires on the same schedule when a sign-in started from it', () => {
+    const reportedAt = new Date('2026-09-28T08:00:00Z').getTime();
+    vi.useFakeTimers({ now: reportedAt });
+    try {
+      useAuthStore.setState({ user: erinHere });
+      useAuthStore.getState().applyOwnStatus({ owner: 'trueHome', status: 'idle' });
+
+      vi.setSystemTime(reportedAt + 1000);
+      reload();
+      useAuthStore.getState().initSession('new-token', erinElsewhere);
+      expect(selectMyChosenStatus(useAuthStore.getState())).toBe('idle');
+
+      vi.advanceTimersByTime(TRUE_HOME_STATUS_MAX_AGE_MS);
+      expect(selectMyChosenStatus(useAuthStore.getState())).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the true home's live report past the kept report's expiry", async () => {
+    const reportedAt = new Date('2026-09-28T08:00:00Z').getTime();
+    vi.useFakeTimers({ now: reportedAt });
+    try {
+      useAuthStore.setState({ user: erinHere });
+      useAuthStore.getState().applyOwnStatus({ owner: 'trueHome', status: 'dnd' });
+
+      vi.setSystemTime(reportedAt + TRUE_HOME_STATUS_MAX_AGE_MS - 1000);
+      reload();
+      vi.spyOn(api.users, 'me').mockResolvedValue(erinHere);
+      await useAuthStore.getState().loadUser();
+      useAuthStore.getState().applyOwnStatus({ owner: 'trueHome', status: 'dnd' });
+
+      vi.advanceTimersByTime(TRUE_HOME_STATUS_MAX_AGE_MS);
+      expect(selectMyChosenStatus(useAuthStore.getState())).toBe('dnd');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not clear the next session after signing out', () => {
+    const reportedAt = new Date('2026-09-28T08:00:00Z').getTime();
+    vi.useFakeTimers({ now: reportedAt });
+    try {
+      useAuthStore.setState({ user: erinHere });
+      useAuthStore.getState().applyOwnStatus({ owner: 'trueHome', status: 'dnd' });
+
+      reload();
+      useAuthStore.getState().initSession('new-token', erinHere);
+      useAuthStore.getState().logout();
+      // The next account's value, set without going through a report.
+      useAuthStore.setState({ user: tomHere, trueHomeStatus: 'online' });
+
+      vi.advanceTimersByTime(TRUE_HOME_STATUS_MAX_AGE_MS + 1);
+      expect(useAuthStore.getState().trueHomeStatus).toBe('online');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('ignores a value kept without its report time (an earlier version kept only the status)', async () => {
+    localStorage.setItem('patogh_true_home_status:nova.example:erin-nova', 'dnd');
+
+    reload();
+    vi.spyOn(api.users, 'me').mockResolvedValue(erinHere);
+    await useAuthStore.getState().loadUser();
+
+    expect(selectMyChosenStatus(useAuthStore.getState())).toBeNull();
+  });
+});

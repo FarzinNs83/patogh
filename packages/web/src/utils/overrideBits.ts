@@ -1,0 +1,51 @@
+import { stringToPermissions } from './permissions';
+import type { OverrideBits } from '@patogh/shared/src/permissions';
+
+// Channel and category overrides as the client reads and edits them
+// (docs/systems/permissions.md, "Resolution Algorithm", step 3). An override
+// is one row per target; a control that switches one permission changes that
+// bit of the row and nothing else.
+
+/** An override row as the override routes list it. */
+export interface StoredOverride {
+  targetType: string;
+  targetId: string;
+  allow: string;
+  deny: string;
+}
+
+/**
+ * One target's override as an editor writes it: the whole row, with the
+ * version of the row the edit started from (`overrideVersion` of the row as
+ * loaded, `NO_OVERRIDE_VERSION` when there was none), so the server can refuse
+ * a write made from an outdated copy (permissions.md, "Concurrent edits").
+ */
+export interface OverrideWrite extends StoredOverride {
+  version: string;
+}
+
+/** Where a bit of an override stands: allowed, denied, or left to the tier above. */
+export type OverrideBitState = 'allow' | 'deny' | 'neutral';
+
+/** A stored row as bits, or null when there is none. */
+export function overrideBitsOf(row: StoredOverride | undefined): OverrideBits | null {
+  return row ? { allow: stringToPermissions(row.allow), deny: stringToPermissions(row.deny) } : null;
+}
+
+/**
+ * `current` with `bits` put in `state`: allowed (and no longer denied),
+ * denied (and no longer allowed) or neither. Every other bit is left as it
+ * is. Null when the result sets nothing, which is the row removed.
+ */
+export function withOverrideBits(current: OverrideBits | null, bits: bigint, state: OverrideBitState): OverrideBits | null {
+  let allow = (current?.allow ?? 0n) & ~bits;
+  let deny = (current?.deny ?? 0n) & ~bits;
+  if (state === 'allow') allow |= bits;
+  if (state === 'deny') deny |= bits;
+  return allow === 0n && deny === 0n ? null : { allow, deny };
+}
+
+/** The override of one target, found by type and id. */
+export function findOverride(overrides: readonly StoredOverride[], targetType: string, targetId: string): StoredOverride | undefined {
+  return overrides.find((o) => o.targetType === targetType && o.targetId === targetId);
+}

@@ -1,0 +1,91 @@
+// Cross-store resolvers for federation identity and API client routing.
+//
+// This module exists SOLELY to break a temporal-dead-zone (TDZ) cycle between
+// spaceStore and instanceStore. instanceStore runs top-level `setXResolver`
+// calls at module load; the backing `let` bindings used to live in spaceStore.
+// When the import graph is entered from instanceStore (e.g. via a component
+// like JoinSpaceModal that imports `useInstanceStore` directly) — or any chain
+// that resolves in an order where spaceStore is mid-load when instanceStore's
+// top-level code runs — the `let _getApiForOrigin = null` declaration has not
+// been evaluated yet, so the setter crashes with
+// `Cannot access '_getApiForOrigin' before initialization`.
+//
+// The fix: hold the resolvers and their setters in this neutral module. It imports nothing from any store, so no back-edge
+// exists and module load order between spaceStore / instanceStore / anything
+// else cannot cause TDZ. spaceStore re-exports the public surface for
+// backward compatibility with existing import sites.
+//
+// IMPORTANT: do not add imports from any `./stores/*` module here. Doing so
+// re-creates the exact cycle this module was carved out to break.
+
+import { api, PatoghApiClient } from '../api/client';
+
+// ─── API client resolution ────────────────────────────────────────────────────
+// Registered by instanceStore on import; maps an origin to the instance-
+// specific API client. `'' | null | undefined` origin always returns the home
+// `api` client.
+
+let _getApiForOrigin: ((origin: string) => PatoghApiClient) | null = null;
+
+export function setApiForOriginResolver(
+  resolver: (origin: string) => PatoghApiClient
+): void {
+  _getApiForOrigin = resolver;
+}
+
+export function getApiForOrigin(origin: string): PatoghApiClient {
+  if (!origin || !_getApiForOrigin) return api;
+  return _getApiForOrigin(origin);
+}
+
+// ─── Hostname → origin resolution (federation) ────────────────────────────────
+// Registered by instanceStore on import; maps a federated user's `homeInstance`
+// hostname (e.g. "remote.example.com") to a full origin URL
+// (e.g. "https://remote.example.com") by looking up connected instances.
+
+let _resolveOriginFromHostname: ((hostname: string) => string) | null = null;
+
+export function setOriginFromHostnameResolver(
+  resolver: (hostname: string) => string
+): void {
+  _resolveOriginFromHostname = resolver;
+}
+
+/**
+ * Pure hostname→origin lookup. Returns '' if the resolver is not yet
+ * registered or the hostname is unknown. Callers that need to combine this
+ * with `window.location.host` or `authStore` state should layer on top
+ * (see `getLayoutHomeOrigin` in spaceStore).
+ */
+export function resolveOriginFromHostname(hostname: string): string {
+  return _resolveOriginFromHostname?.(hostname) ?? '';
+}
+
+// ─── Token resolution (federation) ────────────────────────────────────────────
+// Registered by instanceStore on import; maps an origin to the local user's
+// JWT for that instance. Used by transferStore (tus uploads) and any other
+// path that constructs raw HTTP requests to a federated instance and needs to
+// pass an Authorization header.
+
+let _getTokenForOrigin: ((origin: string) => string | null) | null = null;
+
+export function setTokenForOriginResolver(
+  resolver: (origin: string) => string | null,
+): void {
+  _getTokenForOrigin = resolver;
+}
+
+/**
+ * Returns the JWT to use when calling APIs on the given origin.
+ * - Empty origin → home-instance token from authStore.
+ * - Connected remote → that instance's scoped token.
+ * - Unknown / not-yet-connected → null.
+ *
+ * Note: this module imports nothing from `./stores/*` to avoid TDZ cycles.
+ * The home-instance fallback is supplied by the caller via the resolver itself
+ * (instanceStore registers a resolver that knows how to read authStore for `''`).
+ */
+export function getTokenForOrigin(origin: string): string | null {
+  if (!_getTokenForOrigin) return null;
+  return _getTokenForOrigin(origin);
+}
