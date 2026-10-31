@@ -1,0 +1,588 @@
+import type { FastifyInstance, FastifyRequest } from 'fastify';
+import { eq, and, inArray } from 'drizzle-orm';
+import { getDb, schema } from '../db/index.js';
+import { authenticate } from '../utils/auth.js';
+import { generateSnowflake } from '../utils/snowflake.js';
+import { hasPermission, getChannelSpaceId, PermissionBits } from '../utils/permissions.js';
+import { connectionManager } from '../ws/handler.js';
+import {
+  MAX_MESSAGE_LENGTH,
+  type CreateMessageRequest,
+  type UpdateMessageRequest,
+  type PaginatedQuery,
+  type MessageWithUser,
+  type Reaction,
+  type Embed,
+} from '@patogh/shared';
+import { sanitizeUser } from '../utils/sanitize.js';
+import { userWrittenMessages } from '../db/userWrittenMessages.js';
+import { addsMassMention, hasMassMention, massMentionFields } from '@patogh/shared/src/mentions.js';
+import { deleteAttachmentFiles } from '../utils/fileCleanup.js';
+import { sendError } from '../utils/httpErrors.js';
+import { parseHistoryPage, selectHistoryPage, markHistoryPageHonoured } from '../utils/messagePaging.js';
+import { fetchEmbedsForMessages, resolveEmbeds, reResolveEmbeds, embedRowToEmbed } from '../utils/embedResolver.js';
+
+/**
+ * Fetch reactions for a set of message IDs.
+ * Returns a map from messageId to Reaction[].
+ */
+export function fetchReactionsForMessages(messageIds: string[]): Map<string, Reaction[]> {
+  if (messageIds.length === 0) return new Map();
+  const db = getDb();
+  const reactionRows = db.select()
+    .from(schema.reactions)
+    .where(inArray(schema.reactions.messageId, messageIds))
+    .all();
+
+  // Batch fetch users for reactions
+  const reactionUserIds = [...new Set(reactionRows.map(r => r.userId))];
+  const reactionUsers = reactionUserIds.length > 0
+    ? db.select().from(schema.users).where(inArray(schema.users.id, reactionUserIds)).all()
+    : [];
+  const reactionUserMap = new Map(reactionUsers.map(u => [u.id, u]));
+
+  const map = new Map<string, Reaction[]>();
+  for (const r of reactionRows) {
+    const user = reactionUserMap.get(r.userId);
+    const reaction: Reaction = {
+      id: r.id,
+      messageId: r.messageId,
+      userId: r.userId,
+      emoji: r.emoji,
+      createdAt: r.createdAt,
+      user: user ? sanitizeUser(user) : undefined,
+    };
+    if (!map.has(r.messageId)) {
+      map.set(r.messageId, []);
+    }
+    map.get(r.messageId)!.push(reaction);
+  }
+  return map;
+}
+
+/**
+ * Batch-fetch the reply targets for a set of channel messages, confined to one channel.
+ *
+ * A reply target only ever names a message in the same channel, so the lookup is
+ * scoped to `channelId`. That scoping is what keeps hydration from surfacing a
+ * message from a channel the reader may not have access to, including for rows
+ * written before the create-time check existed.
+ *
+ * The scope has to be the channel rather than the reader's permissions: one
+ * hydrated message is fanned out by `sendToChannel` to an audience whose members
+ * hold different permissions, so there is no single reader to resolve against.
+ * Confining the target to the message's own channel puts the reply preview under
+ * exactly the VIEW_CHANNEL gate that already guards the message carrying it.
+ *
+ * Returns a map from reply-target id to its hydration. Embeds and reactions are
+ * left empty because reply previews do not render them.
+ */
+export function fetchReplyToMessages(
+  channelId: string,
+  messages: (typeof schema.messages.$inferSelect)[],
+): Map<string, MessageWithUser> {
+  const replyToIds = messages
+    .map(m => m.replyToId)
+    .filter((id): id is string => id !== null && id !== undefined);
+
+  if (replyToIds.length === 0) return new Map();
+
+  const db = getDb();
+  const uniqueReplyIds = [...new Set(replyToIds)];
+  const replyMessages = db.select()
+    .from(schema.messages)
+    .where(and(
+      inArray(schema.messages.id, uniqueReplyIds),
+      eq(schema.messages.channelId, channelId),
+    ))
+    .all();
+
+  // Fetch users for reply messages
+  const replyUserIds = [...new Set(replyMessages.map(m => m.userId))];
+  const replyUsers = replyUserIds.length > 0
+    ? db.select().from(schema.users).where(inArray(schema.users.id, replyUserIds)).all()
+    : [];
+  const replyUserMap = new Map(replyUsers.map(u => [u.id, u]));
+
+  // Fetch attachments for reply messages
+  const replyMsgIds = replyMessages.map(m => m.id);
+  const replyAttachments = replyMsgIds.length > 0
+    ? db.select().from(schema.attachments).where(inArray(schema.attachments.messageId, replyMsgIds)).all()
+    : [];
+  const replyAttMap = new Map<string, (typeof schema.attachments.$inferSelect)[]>();
+  for (const att of replyAttachments) {
+    const mid = att.messageId ?? '';
+    if (!replyAttMap.has(mid)) replyAttMap.set(mid, []);
+    replyAttMap.get(mid)!.push(att);
+  }
+
+  const map = new Map<string, MessageWithUser>();
+  for (const rm of replyMessages) {
+    const user = replyUserMap.get(rm.userId);
+    if (!user) continue;
+    const atts = replyAttMap.get(rm.id) ?? [];
+    map.set(rm.id, {
+      id: rm.id,
+      channelId: rm.channelId,
+      userId: rm.userId,
+      replyToId: rm.replyToId,
+      content: rm.content,
+      type: rm.type,
+      editedAt: rm.editedAt,
+      createdAt: rm.createdAt,
+      user: sanitizeUser(user),
+      attachments: atts.map(a => ({
+        id: a.id,
+        messageId: a.messageId ?? rm.id,
+        filename: a.filename,
+        originalName: a.originalName,
+        mimetype: a.mimetype,
+        size: a.size,
+        thumbnailFilename: a.thumbnailFilename ?? null,
+        width: a.width ?? null,
+        height: a.height ?? null,
+        duration: a.duration ?? null,
+        playable: a.playable ?? null,
+        createdAt: a.createdAt,
+      })),
+      embeds: [],
+      reactions: [],
+      replyTo: null,
+    });
+  }
+  return map;
+}
+
+/**
+ * True when `replyToId` names an existing message a member wrote inside
+ * `channelId` (a system row such as a poke takes no replies).
+ *
+ * Used by both channel message-create paths (REST and WebSocket) so a reply can
+ * only ever point at the channel it is posted into. Author permissions are not
+ * enough on their own: an author who may read a restricted channel would
+ * otherwise be able to pull one of its messages into a channel with a wider
+ * audience.
+ */
+export function isReplyTargetInChannel(channelId: string, replyToId: string): boolean {
+  const db = getDb();
+  const target = db.select({ id: schema.messages.id })
+    .from(schema.messages)
+    .where(and(
+      eq(schema.messages.id, replyToId),
+      eq(schema.messages.channelId, channelId),
+      userWrittenMessages(),
+    ))
+    .get();
+  return target !== undefined;
+}
+
+/**
+ * The mass mention stamps of a stored channel message (`massMentionFields`).
+ * A system message is written by this instance and records names people
+ * chose (a poke records its target's name), so its text is never a mention:
+ * a member whose nickname is `@everyone` must not reach every member by
+ * being poked. Only messages members wrote carry the stamps.
+ */
+export function storedMassMentionFields(message: { type: 'user' | 'system'; content: string | null }): { mentionEveryone: boolean; mentionRoleIds: string[] } {
+  if (message.type === 'system') return { mentionEveryone: false, mentionRoleIds: [] };
+  return massMentionFields(message.content);
+}
+
+export function buildMessageWithUser(
+  message: typeof schema.messages.$inferSelect,
+  user: typeof schema.users.$inferSelect,
+  attachmentRows: (typeof schema.attachments.$inferSelect)[],
+  reactions: Reaction[] = [],
+  replyTo: MessageWithUser | null = null,
+  embedRows: (typeof schema.embeds.$inferSelect)[] = [],
+): MessageWithUser {
+  return {
+    id: message.id,
+    channelId: message.channelId,
+    userId: message.userId,
+    replyToId: message.replyToId,
+    content: message.content,
+    type: message.type,
+    editedAt: message.editedAt,
+    createdAt: message.createdAt,
+    ...storedMassMentionFields(message),
+    user: sanitizeUser(user),
+    attachments: attachmentRows.map(a => ({
+      id: a.id,
+      messageId: a.messageId ?? message.id,
+      filename: a.filename,
+      originalName: a.originalName,
+      mimetype: a.mimetype,
+      size: a.size,
+      thumbnailFilename: a.thumbnailFilename ?? null,
+      width: a.width ?? null,
+      height: a.height ?? null,
+      duration: a.duration ?? null,
+      playable: a.playable ?? null,
+      federationStatus: a.federationStatus ?? null,
+      federationMeta: a.federationMeta ?? null,
+      createdAt: a.createdAt,
+    })),
+    embeds: embedRows.map(e => embedRowToEmbed(e)),
+    reactions,
+    replyTo,
+  };
+}
+
+/**
+ * Hydrate channel message rows into the wire shape, keeping their order.
+ *
+ * One batch each for authors, attachments, reactions, embeds and reply
+ * targets (confined to `channelId`, see fetchReplyToMessages). A row whose
+ * author row is missing is dropped. Every read path that returns channel
+ * messages goes through here: history, messages-around and search.
+ */
+export function hydrateChannelMessages(
+  channelId: string,
+  messageRows: (typeof schema.messages.$inferSelect)[],
+): MessageWithUser[] {
+  if (messageRows.length === 0) return [];
+  const db = getDb();
+
+  const userIds = [...new Set(messageRows.map(m => m.userId))];
+  const users = db.select().from(schema.users).where(inArray(schema.users.id, userIds)).all();
+  const userMap = new Map(users.map(u => [u.id, u]));
+
+  const messageIds = messageRows.map(m => m.id);
+  const allAttachments = db.select()
+    .from(schema.attachments)
+    .where(inArray(schema.attachments.messageId, messageIds))
+    .all();
+  const attachmentMap = new Map<string, (typeof schema.attachments.$inferSelect)[]>();
+  for (const att of allAttachments) {
+    const mid = att.messageId ?? '';
+    if (!attachmentMap.has(mid)) attachmentMap.set(mid, []);
+    attachmentMap.get(mid)!.push(att);
+  }
+
+  const reactionsMap = fetchReactionsForMessages(messageIds);
+  const embedMap = fetchEmbedsForMessages(messageIds);
+  const replyToMap = fetchReplyToMessages(channelId, messageRows);
+
+  return messageRows
+    .map(m => {
+      const user = userMap.get(m.userId);
+      if (!user) return null;
+      const reactions = reactionsMap.get(m.id) ?? [];
+      const replyTo = m.replyToId ? (replyToMap.get(m.replyToId) ?? null) : null;
+      return buildMessageWithUser(m, user, attachmentMap.get(m.id) ?? [], reactions, replyTo, embedMap.get(m.id) ?? []);
+    })
+    .filter((m): m is MessageWithUser => m !== null);
+}
+
+export async function messageRoutes(app: FastifyInstance): Promise<void> {
+  // GET /api/channels/:id/messages - Get messages with cursor pagination
+  // (before or after; see docs/systems/api.md, "Message history paging")
+  app.get<{ Params: { id: string }; Querystring: PaginatedQuery }>('/api/channels/:id/messages', {
+    preHandler: authenticate,
+  }, async (request, reply) => {
+    const { id } = request.params;
+
+    const parsed = parseHistoryPage(request.query);
+    if (!parsed.ok) {
+      return sendError(reply, 400, parsed.code);
+    }
+    const { page } = parsed;
+
+    const spaceId = getChannelSpaceId(id);
+    if (!spaceId) {
+      return sendError(reply, 404, 'channel_not_found');
+    }
+
+    if (!hasPermission(request.userId, spaceId, PermissionBits.VIEW_CHANNEL | PermissionBits.READ_MESSAGE_HISTORY, id)) {
+      return sendError(reply, 403, 'missing_permission', { permission: 'VIEW_CHANNEL or READ_MESSAGE_HISTORY' });
+    }
+
+    const db = getDb();
+    const messageRows = selectHistoryPage(page, schema.messages, (cursor, orderBy, limit) =>
+      db.select()
+        .from(schema.messages)
+        .where(and(eq(schema.messages.channelId, id), cursor))
+        .orderBy(...orderBy)
+        .limit(limit)
+        .all(),
+    );
+
+    markHistoryPageHonoured(reply, page);
+    return reply.code(200).send(hydrateChannelMessages(id, messageRows));
+  });
+
+  // POST /api/channels/:id/messages - Create a message
+  app.post<{ Params: { id: string }; Body: CreateMessageRequest }>('/api/channels/:id/messages', {
+    preHandler: authenticate,
+    config: {
+      rateLimit: {
+        max: 5,
+        timeWindow: '5 seconds',
+        // Per client address, like every limit in this app. A route limit runs
+        // on `onRequest` too, before `authenticate`, so there is no user on the
+        // request to key on. See docs/systems/api.md, "Rate limiting".
+        keyGenerator: (request: FastifyRequest) => request.ip,
+      },
+    },
+  }, async (request, reply) => {
+    const { id } = request.params;
+    const { content, attachments: attachmentIds, replyToId } = request.body;
+
+    const spaceId = getChannelSpaceId(id);
+    if (!spaceId) {
+      return sendError(reply, 404, 'channel_not_found');
+    }
+
+    if (!hasPermission(request.userId, spaceId, PermissionBits.SEND_MESSAGES, id)) {
+      return sendError(reply, 403, 'missing_permission', { permission: 'SEND_MESSAGES' });
+    }
+
+    if (attachmentIds && attachmentIds.length > 0 &&
+        !hasPermission(request.userId, spaceId, PermissionBits.ATTACH_FILES, id)) {
+      return sendError(reply, 403, 'missing_permission', { permission: 'ATTACH_FILES' });
+    }
+
+    const hasContent = content && typeof content === 'string' && content.trim().length > 0;
+    const hasAttachments = attachmentIds && attachmentIds.length > 0;
+
+    if (!hasContent && !hasAttachments) {
+      return sendError(reply, 400, 'message_empty');
+    }
+
+    if (content && content.length > MAX_MESSAGE_LENGTH) {
+      return sendError(reply, 400, 'content_too_long', { max: MAX_MESSAGE_LENGTH });
+    }
+
+    // @everyone, @here and role mentions alert many people; only MENTION_EVERYONE
+    // may send them (permissions.md, "Mass mentions").
+    if (hasMassMention(content) && !hasPermission(request.userId, spaceId, PermissionBits.MENTION_EVERYONE, id)) {
+      return sendError(reply, 403, 'missing_permission', { permission: 'MENTION_EVERYONE' });
+    }
+
+    // A reply may only target a message in the channel it is posted into.
+    if (replyToId && !isReplyTargetInChannel(id, replyToId)) {
+      return sendError(reply, 400, 'reply_target_invalid');
+    }
+
+    const db = getDb();
+    const messageId = generateSnowflake();
+    const now = Date.now();
+
+    // Verify attachment ownership before linking
+    if (attachmentIds && attachmentIds.length > 0) {
+      for (const attId of attachmentIds) {
+        const att = db.select().from(schema.attachments).where(eq(schema.attachments.id, attId)).get();
+        if (!att || att.messageId || att.dmMessageId) {
+          return sendError(reply, 400, 'attachment_invalid');
+        }
+        // Skip ownership check for legacy uploads (null uploaderId)
+        if (att.uploaderId && att.uploaderId !== request.userId) {
+          return sendError(reply, 400, 'attachment_not_owned');
+        }
+      }
+    }
+
+    // Insert message and link attachments atomically
+    db.transaction((tx) => {
+      tx.insert(schema.messages).values({
+        id: messageId,
+        channelId: id,
+        userId: request.userId,
+        replyToId: replyToId || null,
+        content: content?.trim() || null,
+        createdAt: now,
+      }).run();
+
+      if (attachmentIds && attachmentIds.length > 0) {
+        for (const attId of attachmentIds) {
+          tx.update(schema.attachments)
+            .set({ messageId })
+            .where(eq(schema.attachments.id, attId))
+            .run();
+        }
+      }
+    });
+
+    const user = db.select().from(schema.users).where(eq(schema.users.id, request.userId)).get();
+    if (!user) {
+      return sendError(reply, 500, 'internal_error');
+    }
+
+    const attachmentRows = db.select()
+      .from(schema.attachments)
+      .where(eq(schema.attachments.messageId, messageId))
+      .all();
+
+    const message = db.select().from(schema.messages).where(eq(schema.messages.id, messageId)).get();
+    if (!message) {
+      return sendError(reply, 500, 'internal_error');
+    }
+
+    // Hydrate the reply-to message if present. Reply targets are confined to
+    // the message's own channel.
+    let replyTo: MessageWithUser | null = null;
+    if (message.replyToId) {
+      const replyToMap = fetchReplyToMessages(message.channelId, [message]);
+      replyTo = replyToMap.get(message.replyToId) ?? null;
+    }
+
+    const messageWithUser = buildMessageWithUser(message, user, attachmentRows, [], replyTo);
+
+    // Broadcast via WebSocket
+    connectionManager.sendToChannel(spaceId, id, {
+      type: 'message_created',
+      message: messageWithUser,
+    });
+
+    // Resolve embeds asynchronously after responding
+    setImmediate(() => {
+      resolveEmbeds(messageId, content?.trim() || null, id, false, spaceId).catch(() => {});
+    });
+
+    return reply.code(201).send(messageWithUser);
+  });
+
+  // PATCH /api/messages/:id - Edit a message (author only)
+  app.patch<{ Params: { id: string }; Body: UpdateMessageRequest }>('/api/messages/:id', {
+    preHandler: authenticate,
+  }, async (request, reply) => {
+    const { id } = request.params;
+    const { content } = request.body;
+
+    if (!content || typeof content !== 'string' || content.trim().length === 0) {
+      return sendError(reply, 400, 'content_required');
+    }
+
+    if (content.length > MAX_MESSAGE_LENGTH) {
+      return sendError(reply, 400, 'content_too_long', { max: MAX_MESSAGE_LENGTH });
+    }
+
+    const db = getDb();
+    const message = db.select().from(schema.messages).where(eq(schema.messages.id, id)).get();
+    if (!message) {
+      return sendError(reply, 404, 'message_not_found');
+    }
+
+    // A system row (a poke) is written by this instance, so nobody edits it,
+    // its author included; the DM routes refuse theirs with the same code.
+    if (message.type === 'system') {
+      return sendError(reply, 403, 'system_message_immutable');
+    }
+    if (message.userId !== request.userId) {
+      return sendError(reply, 403, 'message_edit_not_author');
+    }
+
+    // An edit that adds a mass mention needs the same permission as sending
+    // one. Keeping the ones the message already has does not.
+    const mentionSpaceId = getChannelSpaceId(message.channelId);
+    if (addsMassMention(message.content, content) && (!mentionSpaceId || !hasPermission(request.userId, mentionSpaceId, PermissionBits.MENTION_EVERYONE, message.channelId))) {
+      return sendError(reply, 403, 'missing_permission', { permission: 'MENTION_EVERYONE' });
+    }
+
+    const now = Date.now();
+    db.update(schema.messages)
+      .set({ content: content.trim(), editedAt: now })
+      .where(eq(schema.messages.id, id))
+      .run();
+
+    const updatedMessage = db.select().from(schema.messages).where(eq(schema.messages.id, id)).get();
+    if (!updatedMessage) {
+      return sendError(reply, 500, 'internal_error');
+    }
+
+    const user = db.select().from(schema.users).where(eq(schema.users.id, message.userId)).get();
+    if (!user) {
+      return sendError(reply, 500, 'internal_error');
+    }
+
+    const attachmentRows = db.select()
+      .from(schema.attachments)
+      .where(eq(schema.attachments.messageId, id))
+      .all();
+
+    // Delete old embeds synchronously so the broadcast reflects the edit
+    db.delete(schema.embeds).where(eq(schema.embeds.messageId, id)).run();
+
+    // Hydrate reactions and reply-to (embeds are empty after deletion)
+    const reactionsMap = fetchReactionsForMessages([id]);
+    const reactions = reactionsMap.get(id) ?? [];
+    let replyTo: MessageWithUser | null = null;
+    if (updatedMessage.replyToId) {
+      const replyToMap = fetchReplyToMessages(updatedMessage.channelId, [updatedMessage]);
+      replyTo = replyToMap.get(updatedMessage.replyToId) ?? null;
+    }
+
+    const messageWithUser = buildMessageWithUser(updatedMessage, user, attachmentRows, reactions, replyTo, []);
+
+    // Broadcast edit (with empty embeds — new ones arrive via embeds_resolved).
+    // The audience is the channel, not the space: the payload carries the full
+    // message, so it goes to the same VIEW_CHANNEL holders that received the
+    // original message_created. Matches the WebSocket message_edit handler.
+    const spaceId = getChannelSpaceId(message.channelId);
+    if (spaceId) {
+      connectionManager.sendToChannel(spaceId, message.channelId, {
+        type: 'message_updated',
+        message: messageWithUser,
+      });
+
+      // Resolve new embeds asynchronously (old ones already deleted above)
+      setImmediate(() => {
+        resolveEmbeds(id, content.trim(), message.channelId, false, spaceId).catch(() => {});
+      });
+    }
+
+    return reply.code(200).send(messageWithUser);
+  });
+
+  // DELETE /api/messages/:id - Delete a message (author or admin)
+  app.delete<{ Params: { id: string } }>('/api/messages/:id', {
+    preHandler: authenticate,
+  }, async (request, reply) => {
+    const { id } = request.params;
+    const db = getDb();
+
+    const message = db.select().from(schema.messages).where(eq(schema.messages.id, id)).get();
+    if (!message) {
+      return sendError(reply, 404, 'message_not_found');
+    }
+
+    const spaceId = getChannelSpaceId(message.channelId);
+    if (!spaceId) {
+      return sendError(reply, 404, 'channel_not_found');
+    }
+
+    const isAuthor = message.userId === request.userId;
+    const canManageMessages = hasPermission(request.userId, spaceId, PermissionBits.MANAGE_MESSAGES, message.channelId);
+
+    if (!isAuthor && !canManageMessages) {
+      return sendError(reply, 403, 'message_delete_forbidden');
+    }
+
+    // Collect attachment filenames before deleting
+    const attachmentRows = db.select({ filename: schema.attachments.filename })
+      .from(schema.attachments)
+      .where(eq(schema.attachments.messageId, id))
+      .all();
+
+    // Delete attachments and message atomically
+    db.transaction((tx) => {
+      tx.delete(schema.attachments).where(eq(schema.attachments.messageId, id)).run();
+      tx.delete(schema.messages).where(eq(schema.messages.id, id)).run();
+    });
+
+    // Clean up files from disk after transaction commits
+    deleteAttachmentFiles(attachmentRows);
+
+    // Broadcast deletion to the channel's audience. A member without
+    // VIEW_CHANNEL never saw the message and must not learn that it existed.
+    // Matches the WebSocket message_delete handler.
+    connectionManager.sendToChannel(spaceId, message.channelId, {
+      type: 'message_deleted',
+      messageId: id,
+      channelId: message.channelId,
+    });
+
+    return reply.code(200).send({ success: true });
+  });
+}
