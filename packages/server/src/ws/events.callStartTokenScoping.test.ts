@@ -1,0 +1,467 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import * as schema from '../db/schema.js';
+import { setWorkerId } from '../utils/snowflake.js';
+
+setWorkerId(1);
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+type TestDb = ReturnType<typeof drizzle<typeof schema>>;
+let testDb: TestDb;
+
+vi.mock('../db/index.js', () => ({
+  getDb: () => testDb,
+  schema,
+}));
+
+vi.mock('../utils/federationAuth.js', async () => {
+  const actual = await vi.importActual<typeof import('../utils/federationAuth.js')>(
+    '../utils/federationAuth.js',
+  );
+  return {
+    ...actual,
+    getOurOrigin: () => 'https://local.example',
+    buildFederationHeaders: () => ({}),
+  };
+});
+
+// Mock the REAL token factory (`routes/livekit.js`) so each minted token is
+// traceable back to the identity it was minted for. A LiveKit token is a bearer
+// credential; these tests assert exactly which identities' credentials leave
+// this instance and to whom.
+vi.mock('../routes/livekit.js', () => ({
+  generateFederatedCallToken: (roomName: string, homeUserId: string) =>
+    Promise.resolve(`token:${roomName}:${homeUserId}`),
+}));
+
+type CallRelayEvent = {
+  messageId: string;
+  federatedId?: string;
+  call?: {
+    tokens?: Record<string, string>;
+    memberTokens?: Array<{ homeUserId: string; homeInstance: string; token: string }>;
+    participants?: Array<{ homeUserId: string; homeInstance: string }>;
+    caller?: { homeUserId: string; homeInstance: string };
+  };
+};
+type RelayArgs = [string, CallRelayEvent[]];
+const sendCallRelayMock = vi.fn();
+vi.mock('../utils/federationOutbox.js', async () => {
+  const actual = await vi.importActual<typeof import('../utils/federationOutbox.js')>(
+    '../utils/federationOutbox.js',
+  );
+  return {
+    ...actual,
+    sendCallRelay: (...args: RelayArgs) => sendCallRelayMock(...args),
+  };
+});
+
+vi.mock('../config.js', async () => {
+  const actual = await vi.importActual<typeof import('../config.js')>('../config.js');
+  return {
+    ...actual,
+    config: {
+      ...actual.config,
+      domain: 'local.example',
+      livekit: {
+        url: 'wss://local.example/livekit',
+        apiKey: 'key',
+        apiSecret: 'secret',
+      },
+    },
+  };
+});
+
+function applyMigrations(db: Database.Database): void {
+  const migrationsDir = path.resolve(__dirname, '../../drizzle');
+  const files = fs.readdirSync(migrationsDir).filter(f => f.endsWith('.sql')).sort();
+  for (const f of files) {
+    const sql = fs.readFileSync(path.join(migrationsDir, f), 'utf8');
+    const statements = sql.split(/-->\s*statement-breakpoint/);
+    for (const stmt of statements) {
+      const clean = stmt.trim();
+      if (clean) db.exec(clean);
+    }
+  }
+}
+
+function seedActivePeer(origin: string, instanceName: string): void {
+  testDb.insert(schema.federationPeers).values({
+    id: `peer-${origin}`,
+    origin,
+    hmacSecret: 'secret',
+    status: 'active',
+    instanceName,
+    lastSyncedAt: 0,
+    createdAt: Date.now(),
+  }).run();
+}
+
+function seedLocalUser(id: string, opts: { homeUserId?: string | null; homeInstance?: string | null } = {}): void {
+  testDb.insert(schema.users).values({
+    id,
+    username: id,
+    passwordHash: 'test',
+    homeUserId: opts.homeUserId ?? null,
+    homeInstance: opts.homeInstance ?? null,
+    createdAt: Date.now(),
+  }).run();
+}
+
+function seedDmChannel(id: string, federatedId: string | null, ownerId: string | null): void {
+  testDb.insert(schema.dmChannels).values({
+    id,
+    ownerId,
+    federatedId,
+    createdAt: Date.now(),
+  }).run();
+}
+
+function seedDmMember(dmChannelId: string, userId: string): void {
+  testDb.insert(schema.dmMembers).values({ dmChannelId, userId }).run();
+}
+
+async function importSUT() {
+  return await import('./events.js');
+}
+
+async function importManager() {
+  return (await import('./handler.js')).connectionManager;
+}
+
+/** All origins `sendCallRelay` was invoked with, in call order. */
+function relayedOrigins(): string[] {
+  return sendCallRelayMock.mock.calls.map(([origin]) => origin as string);
+}
+
+/** The single relay event sent to `origin`, or undefined if none was sent. */
+function relayTo(origin: string): CallRelayEvent | undefined {
+  const call = sendCallRelayMock.mock.calls.find(([o]) => o === origin);
+  return call ? (call[1] as CallRelayEvent[])[0] : undefined;
+}
+
+let sqlite: Database.Database;
+
+describe('sendFederatedCallStart — LiveKit token scoping', () => {
+  beforeEach(async () => {
+    sqlite = new Database(':memory:');
+    testDb = drizzle(sqlite, { schema });
+    applyMigrations(sqlite);
+
+    const cm = await importManager();
+    for (const [fedId] of cm.getAllFederatedCalls()) cm.clearFederatedCall(fedId);
+    sendCallRelayMock.mockReset();
+    sendCallRelayMock.mockResolvedValue({ ok: true, undeliverable: [] });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    sqlite.close();
+  });
+
+  it('local-only DM call sends no relay at all, even with active peers present', async () => {
+    // Both members are homed here. No peer hosts a participant, so no peer has
+    // any business learning the call exists — let alone holding a room token.
+    seedLocalUser('alice', { homeUserId: null, homeInstance: null });
+    seedLocalUser('dave', { homeUserId: null, homeInstance: null });
+    seedDmChannel('dm-local', 'fed-local-only', null);
+    seedDmMember('dm-local', 'alice');
+    seedDmMember('dm-local', 'dave');
+    seedActivePeer('https://orbit.example', 'Orbit');
+    seedActivePeer('https://nova.example', 'Nova');
+
+    const cm = await importManager();
+    cm.createDmRoom('dm-local', 'alice');
+
+    const { sendFederatedCallStartForTest } = await importSUT();
+    await sendFederatedCallStartForTest('dm-local', 'alice', 'Alice');
+
+    expect(relayedOrigins()).toEqual([]);
+  });
+
+  it('gives each peer tokens only for the members it hosts, and nothing to uninvolved peers', async () => {
+    // Group DM: caller alice (local), dave (local), bob (orbit), carol (nova).
+    // ghost.example is an active peer hosting nobody in this DM.
+    seedLocalUser('alice', { homeUserId: null, homeInstance: null });
+    seedLocalUser('dave', { homeUserId: null, homeInstance: null });
+    seedLocalUser('bob-stub', { homeUserId: 'bob-home', homeInstance: 'https://orbit.example' });
+    seedLocalUser('carol-stub', { homeUserId: 'carol-home', homeInstance: 'https://nova.example' });
+    seedDmChannel('dm-group', 'fed-group', 'alice');
+    seedDmMember('dm-group', 'alice');
+    seedDmMember('dm-group', 'dave');
+    seedDmMember('dm-group', 'bob-stub');
+    seedDmMember('dm-group', 'carol-stub');
+    seedActivePeer('https://orbit.example', 'Orbit');
+    seedActivePeer('https://nova.example', 'Nova');
+    seedActivePeer('https://ghost.example', 'Ghost');
+
+    const cm = await importManager();
+    cm.createDmRoom('dm-group', 'alice');
+
+    const { sendFederatedCallStartForTest } = await importSUT();
+    await sendFederatedCallStartForTest('dm-group', 'alice', 'Alice');
+
+    // Only the two participant-hosting peers were contacted.
+    expect(relayedOrigins().sort()).toEqual([
+      'https://nova.example',
+      'https://orbit.example',
+    ]);
+    expect(relayTo('https://ghost.example')).toBeUndefined();
+
+    const orbit = relayTo('https://orbit.example');
+    const nova = relayTo('https://nova.example');
+    expect(orbit).toBeDefined();
+    expect(nova).toBeDefined();
+
+    // Each peer receives exactly one token: the one for the member it hosts.
+    expect(orbit!.call?.tokens).toEqual({
+      'bob-home': 'token:fed-group:bob-home',
+    });
+    expect(nova!.call?.tokens).toEqual({
+      'carol-home': 'token:fed-group:carol-home',
+    });
+
+    // Neither peer receives a credential for a local member or the caller.
+    for (const relay of [orbit!, nova!]) {
+      const keys = Object.keys(relay.call?.tokens ?? {});
+      expect(keys).not.toContain('alice');
+      expect(keys).not.toContain('dave');
+    }
+
+    // The non-secret roster still names every participant, so Path B identity
+    // matching on the recipient keeps working.
+    expect(
+      (nova!.call?.participants ?? []).map(p => p.homeUserId).sort(),
+    ).toEqual(['alice', 'bob-home', 'carol-home', 'dave']);
+  });
+
+  it('mints a token for every remote member of a single peer', async () => {
+    // Two members homed on the same peer: that peer legitimately needs both.
+    seedLocalUser('alice', { homeUserId: null, homeInstance: null });
+    seedLocalUser('bob-stub', { homeUserId: 'bob-home', homeInstance: 'https://orbit.example' });
+    seedLocalUser('erin-stub', { homeUserId: 'erin-home', homeInstance: 'https://orbit.example' });
+    seedDmChannel('dm-same-peer', 'fed-same-peer', 'alice');
+    seedDmMember('dm-same-peer', 'alice');
+    seedDmMember('dm-same-peer', 'bob-stub');
+    seedDmMember('dm-same-peer', 'erin-stub');
+    seedActivePeer('https://orbit.example', 'Orbit');
+
+    const cm = await importManager();
+    cm.createDmRoom('dm-same-peer', 'alice');
+
+    const { sendFederatedCallStartForTest } = await importSUT();
+    await sendFederatedCallStartForTest('dm-same-peer', 'alice', 'Alice');
+
+    expect(relayedOrigins()).toEqual(['https://orbit.example']);
+    expect(relayTo('https://orbit.example')!.call?.tokens).toEqual({
+      'bob-home': 'token:fed-same-peer:bob-home',
+      'erin-home': 'token:fed-same-peer:erin-home',
+    });
+  });
+
+  it('names each token\'s holder by federated identity, with its home instance', async () => {
+    seedLocalUser('alice', { homeUserId: null, homeInstance: null });
+    seedLocalUser('bob-stub', { homeUserId: 'bob-home', homeInstance: 'https://orbit.example' });
+    seedDmChannel('dm-ids', 'fed-ids', 'alice');
+    seedDmMember('dm-ids', 'alice');
+    seedDmMember('dm-ids', 'bob-stub');
+    seedActivePeer('https://orbit.example', 'Orbit');
+
+    const cm = await importManager();
+    cm.createDmRoom('dm-ids', 'alice');
+
+    const { sendFederatedCallStartForTest } = await importSUT();
+    await sendFederatedCallStartForTest('dm-ids', 'alice', 'Alice');
+
+    expect(relayTo('https://orbit.example')!.call?.memberTokens).toEqual([
+      { homeUserId: 'bob-home', homeInstance: 'https://orbit.example', token: 'token:fed-ids:bob-home' },
+    ]);
+  });
+});
+
+describe('sendFederatedCallStart — the conversation key', () => {
+  beforeEach(async () => {
+    sqlite = new Database(':memory:');
+    testDb = drizzle(sqlite, { schema });
+    applyMigrations(sqlite);
+
+    const cm = await importManager();
+    for (const [fedId] of cm.getAllFederatedCalls()) cm.clearFederatedCall(fedId);
+    sendCallRelayMock.mockReset();
+    sendCallRelayMock.mockResolvedValue({ ok: true, undeliverable: [] });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    sqlite.close();
+  });
+
+  function storedKey(id: string): string | null {
+    return testDb.select().from(schema.dmChannels).all().find(c => c.id === id)!.federatedId;
+  }
+
+  it.each([
+    ['a group', 'alice'],
+    ['a 1-on-1', null],
+  ])('%s without a key is not announced, and call start mints no key for it', async (_label, ownerId) => {
+    // A group keyed nowhere has no copy on any peer (its key is minted with the
+    // owner identity when it first gets a member homed elsewhere); a keyless
+    // 1-on-1 cannot exist once the startup backfill has run.
+    seedLocalUser('alice', { homeUserId: null, homeInstance: null });
+    seedLocalUser('bob-stub', { homeUserId: 'bob-home', homeInstance: 'https://orbit.example' });
+    seedDmChannel('dm-unkeyed', null, ownerId);
+    seedDmMember('dm-unkeyed', 'alice');
+    seedDmMember('dm-unkeyed', 'bob-stub');
+    seedActivePeer('https://orbit.example', 'Orbit');
+
+    const cm = await importManager();
+    cm.createDmRoom('dm-unkeyed', 'alice');
+
+    const { sendFederatedCallStartForTest } = await importSUT();
+    await sendFederatedCallStartForTest('dm-unkeyed', 'alice', 'Alice');
+
+    expect(relayedOrigins()).toEqual([]);
+    expect(storedKey('dm-unkeyed')).toBeNull();
+  });
+});
+
+describe('sendFederatedCallStart: group call rules', () => {
+  beforeEach(async () => {
+    sqlite = new Database(':memory:');
+    testDb = drizzle(sqlite, { schema });
+    applyMigrations(sqlite);
+
+    const cm = await importManager();
+    for (const [fedId] of cm.getAllFederatedCalls()) cm.clearFederatedCall(fedId);
+    sendCallRelayMock.mockReset();
+    sendCallRelayMock.mockResolvedValue({ ok: true, undeliverable: [] });
+  });
+
+  afterEach(async () => {
+    const cm = await importManager();
+    cm.destroyRoom('dm-rules');
+    vi.restoreAllMocks();
+    sqlite.close();
+  });
+
+  it.each([
+    ['a group', 'alice', '6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a4b', true],
+    ['a 1-on-1', null, '0123456789abcdef0123456789abcdef', undefined],
+  ])('%s call start says whether the host applies the group rules', async (_label, ownerId, key, perMember) => {
+    seedLocalUser('alice', { homeUserId: null, homeInstance: null });
+    seedLocalUser('bob-stub', { homeUserId: 'bob-home', homeInstance: 'https://orbit.example' });
+    seedDmChannel('dm-rules', key, ownerId);
+    seedDmMember('dm-rules', 'alice');
+    seedDmMember('dm-rules', 'bob-stub');
+    seedActivePeer('https://orbit.example', 'Orbit');
+
+    const cm = await importManager();
+    cm.createDmRoom('dm-rules', 'alice');
+
+    const { sendFederatedCallStartForTest } = await importSUT();
+    await sendFederatedCallStartForTest('dm-rules', 'alice', 'Alice');
+
+    const call = relayTo('https://orbit.example')!.call as { perMember?: boolean } | undefined;
+    expect(call?.perMember).toBe(perMember);
+  });
+});
+
+describe('sendFederatedCallStart: the name it gives the caller', () => {
+  // A call start names its caller the way every call relay names its actor
+  // (`callRelayActor`): by their own identity, to a peer that accepts it from
+  // here, which is one where the caller is homed here or on that peer.
+  const ORBIT = 'https://orbit.example';
+  const NOVA = 'https://nova.example';
+
+  beforeEach(async () => {
+    sqlite = new Database(':memory:');
+    testDb = drizzle(sqlite, { schema });
+    applyMigrations(sqlite);
+    const cm = await importManager();
+    for (const [fedId] of cm.getAllFederatedCalls()) cm.clearFederatedCall(fedId);
+    sendCallRelayMock.mockReset();
+    sendCallRelayMock.mockResolvedValue({ ok: true, undeliverable: [] });
+    seedActivePeer(ORBIT, 'Orbit');
+    seedActivePeer(NOVA, 'Nova');
+    seedLocalUser('alice', { homeUserId: null, homeInstance: null });
+    // grace is a federated account here; her home is orbit.
+    seedLocalUser('grace', { homeUserId: 'grace-home', homeInstance: ORBIT });
+    seedLocalUser('frank-stub', { homeUserId: 'frank-home', homeInstance: ORBIT });
+    seedLocalUser('heidi-stub', { homeUserId: 'heidi-home', homeInstance: NOVA });
+  });
+
+  afterEach(async () => {
+    const cm = await importManager();
+    for (const id of ['dm-native', 'dm-grace-group', 'dm-grace-heidi']) cm.destroyRoom(id);
+    vi.restoreAllMocks();
+    sqlite.close();
+  });
+
+  it('names a caller homed here by this instance', async () => {
+    seedDmChannel('dm-native', 'fed-native', 'alice');
+    seedDmMember('dm-native', 'alice');
+    seedDmMember('dm-native', 'heidi-stub');
+    const cm = await importManager();
+    cm.createDmRoom('dm-native', 'alice');
+
+    const { sendFederatedCallStartForTest } = await importSUT();
+    await sendFederatedCallStartForTest('dm-native', 'alice', 'Alice');
+
+    expect(relayTo(NOVA)?.call?.caller).toEqual({ homeUserId: 'alice', homeInstance: 'https://local.example', displayName: 'Alice' });
+  });
+
+  it('names a federated account by its home, rings its home\'s members, and reports a third instance it cannot name the caller to', async () => {
+    // grace (home orbit) calls a group with alice here, frank on orbit and heidi on nova.
+    seedDmChannel('dm-grace-group', 'fed-grace-group', 'grace');
+    for (const m of ['grace', 'alice', 'frank-stub', 'heidi-stub']) seedDmMember('dm-grace-group', m);
+    const cm = await importManager();
+    cm.createDmRoom('dm-grace-group', 'grace');
+    const sent = vi.spyOn(cm, 'sendToUser');
+
+    const { sendFederatedCallStartForTest } = await importSUT();
+    await sendFederatedCallStartForTest('dm-grace-group', 'grace', 'Grace');
+
+    // orbit is her home: it accepts her coming home, and is given a token for
+    // frank only, never one for the caller.
+    expect(relayedOrigins()).toEqual([ORBIT]);
+    const toOrbit = relayTo(ORBIT)!;
+    expect(toOrbit.call?.caller).toEqual({ homeUserId: 'grace-home', homeInstance: ORBIT, displayName: 'Grace' });
+    expect(toOrbit.call?.memberTokens?.map(t => t.homeUserId)).toEqual(['frank-home']);
+    // nova accepts from here neither this instance's address for her nor her
+    // own identity, so nothing goes there and she is told why.
+    expect(sent).toHaveBeenCalledWith('grace', expect.objectContaining({
+      type: 'dm_call_undeliverable',
+      phase: 'start',
+      terminal: false,
+      failures: [expect.objectContaining({ reason: 'identity_not_accepted', peerOrigin: NOVA, affectedUserIds: ['heidi-stub'] })],
+    }));
+    expect(cm.getRoom('dm-grace-group')).toBeDefined();
+  });
+
+  it('ends the ring when the only members it would ring are on such a third instance', async () => {
+    seedDmChannel('dm-grace-heidi', 'fed-grace-heidi', null);
+    seedDmMember('dm-grace-heidi', 'grace');
+    seedDmMember('dm-grace-heidi', 'heidi-stub');
+    const cm = await importManager();
+    cm.createDmRoom('dm-grace-heidi', 'grace');
+    const sent = vi.spyOn(cm, 'sendToUser');
+
+    const { sendFederatedCallStartForTest } = await importSUT();
+    await sendFederatedCallStartForTest('dm-grace-heidi', 'grace', 'Grace');
+
+    // Nova accepts no name for grace from here: her own identity is homed on
+    // a third instance, and this instance's address would be a made-up one.
+    // So nova is not sent the start, and grace is told why.
+    expect(relayedOrigins()).toEqual([]);
+    expect(cm.getRoom('dm-grace-heidi')).toBeUndefined();
+    expect(sent).toHaveBeenCalledWith('grace', expect.objectContaining({
+      type: 'dm_call_undeliverable',
+      terminal: true,
+      failures: [expect.objectContaining({ reason: 'identity_not_accepted', peerOrigin: NOVA })],
+    }));
+  });
+});
