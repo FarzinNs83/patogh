@@ -1,18 +1,49 @@
 #!/usr/bin/env bash
-# Restore the Patogh SQLite DB from a snapshot in data/backups/.
-# Usage:
-#   ./restore.sh                 List available snapshots.
-#   ./restore.sh <snapshot.db>   Restore the named snapshot (path or basename).
-set -euo pipefail
+# =============================================================================
+#  restore.sh -- restore the Patogh database from a snapshot in data/backups/
+#
+#  What it does
+#    1. without an argument, lists the snapshots (newest first)
+#    2. with one, stops the patogh container, saves the current database as a
+#       pre-restore snapshot, puts the chosen one in place and starts it again
+#
+#  Usage:
+#    ./restore.sh
+#    ./restore.sh <snapshot.db>
+#
+#  Options: --help
+# =============================================================================
+set -Eeuo pipefail
 cd "$(dirname "$0")"
+
+say() { printf '[+] %s\n' "$*"; }
+die() {
+  printf '[x] %s\n' "$*" >&2
+  exit 1
+}
+
+case "${1:-}" in
+  -h | --help)
+    cat << 'EOF'
+restore.sh -- restore the Patogh database from a snapshot in data/backups/.
+
+Usage:
+  ./restore.sh                  list the snapshots, newest first
+  ./restore.sh <snapshot.db>    restore one (file name or path); the current
+                                database is saved first as a pre-restore snapshot
+  -h, --help                    show this help
+
+Take a snapshot with ./backup.sh.
+EOF
+    exit 0
+    ;;
+  -*) die "Unknown option: $1 (try --help)." ;;
+esac
 
 BACKUP_DIR="data/backups"
 DB="data/patogh.db"
 
-if [[ ! -d "$BACKUP_DIR" ]]; then
-  echo "No backups directory at $BACKUP_DIR." >&2
-  exit 1
-fi
+[[ -d "$BACKUP_DIR" ]] || die "No backups folder at $BACKUP_DIR."
 
 # No arg: list snapshots newest-first and exit.
 if [[ $# -eq 0 ]]; then
@@ -20,31 +51,31 @@ if [[ $# -eq 0 ]]; then
   snaps=("$BACKUP_DIR"/*.db)
   shopt -u nullglob
   if [[ ${#snaps[@]} -eq 0 ]]; then
-    echo "No snapshots found in $BACKUP_DIR."
+    say "No snapshots in $BACKUP_DIR."
     exit 0
   fi
-  echo "Available snapshots (newest first):"
+  echo "Snapshots (newest first):"
   for f in $(ls -1t "$BACKUP_DIR"/*.db); do
     printf "  %s  (%s)\n" "$(basename "$f")" "$(du -h "$f" | cut -f1)"
   done
   echo ""
-  echo "Restore with: ./restore.sh <snapshot-filename>"
+  echo "Restore with: ./restore.sh <snapshot>"
   exit 0
 fi
 
 # Resolve the snapshot to a basename inside BACKUP_DIR (restore is always from data/backups/).
 SNAP_NAME="$(basename "$1")"
-if [[ ! -f "$BACKUP_DIR/$SNAP_NAME" ]]; then
-  echo "Snapshot not found in $BACKUP_DIR: $SNAP_NAME" >&2
-  exit 1
-fi
+[[ -f "$BACKUP_DIR/$SNAP_NAME" ]] || die "Snapshot not found in $BACKUP_DIR: $SNAP_NAME"
 
 echo "About to restore: $BACKUP_DIR/$SNAP_NAME"
-echo "This will REPLACE $DB. The current DB is saved first as a pre-restore snapshot."
+echo "This REPLACES $DB. The current database is saved first as a pre-restore snapshot."
 read -rp "Continue? [y/N] " yn
-[[ "${yn,,}" == "y" ]] || { echo "Aborted."; exit 0; }
+[[ "${yn,,}" == "y" ]] || {
+  echo "Aborted."
+  exit 0
+}
 
-echo "[1/3] Stopping patogh container..."
+say "[1/3] Stopping the patogh container ..."
 docker compose stop patogh
 
 # data/patogh.db and data/backups/ are container-owned (uid 1000, the non-root runtime
@@ -52,7 +83,7 @@ docker compose stop patogh
 # container that mounts data/ (root can rewrite the uid-1000-owned files).
 # (Run as a user in the docker group, or with sudo.)
 TS="$(date -u +%Y%m%dT%H%M%S)"
-echo "[2/3] Swapping DB inside a root container (pre-restore copy + WAL clear + install)..."
+say "[2/3] Swapping the database inside a root container (pre-restore copy, WAL clear, install) ..."
 docker run --rm -v "$(pwd)/data:/data" alpine sh -c '
   set -e
   if [ -f /data/patogh.db ]; then
@@ -62,6 +93,6 @@ docker run --rm -v "$(pwd)/data:/data" alpine sh -c '
   cp "/data/backups/$2" /data/patogh.db
 ' sh "$TS" "$SNAP_NAME"
 
-echo "[3/3] Starting patogh container..."
+say "[3/3] Starting the patogh container ..."
 docker compose start patogh
-echo "Done. Watch health: docker compose logs -f patogh"
+say "Done. Watch it come up: docker compose logs -f patogh"

@@ -1,16 +1,28 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
-# Patogh — Electron Installer Build Script
-# ============================================================
-# Builds Electron installers for all platforms/architectures
-# (macOS, Windows, Linux × arm64, x64) and copies the user-
-# distributable artifacts into packages/desktop/installers/.
+#  electronbuild.sh -- Patogh desktop installers for macOS, Windows and Linux
+#                      (arm64 and x64), copied to packages/desktop/installers/
 #
-# Usage:
-#   ./electronbuild.sh
+#  Usage:
+#    ./electronbuild.sh
+#
+#  Options: --help
 # ============================================================
+set -Eeuo pipefail
 
-set -euo pipefail
+case "${1:-}" in
+  "") ;;
+  -h | --help)
+    printf '%s
+' "electronbuild.sh -- build the desktop installers (mac / win / linux x arm64 / x64)"       "into packages/desktop/installers/." "" "Usage:" "  ./electronbuild.sh"
+    exit 0
+    ;;
+  *)
+    printf '[x] Unknown option: %s (try --help).
+' "$1" >&2
+    exit 1
+    ;;
+esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DESKTOP_DIR="$REPO_ROOT/packages/desktop"
@@ -18,15 +30,15 @@ DIST_DIR="$DESKTOP_DIR/dist-electron"
 INSTALLERS_DIR="$DESKTOP_DIR/installers"
 
 if [ ! -d "$DESKTOP_DIR" ]; then
-  echo "Error: $DESKTOP_DIR not found" >&2
+  echo "[x] $DESKTOP_DIR not found" >&2
   exit 1
 fi
 
-echo "==> Building Electron installers (mac/win/linux × arm64/x64)..."
+echo "[+] Building Electron installers (mac/win/linux x arm64/x64)..."
 cd "$DESKTOP_DIR"
 npm run build:all
 
-echo "==> Copying installers to $INSTALLERS_DIR"
+echo "[+] Copying installers to $INSTALLERS_DIR"
 mkdir -p "$INSTALLERS_DIR"
 rm -f "$INSTALLERS_DIR"/*.dmg \
       "$INSTALLERS_DIR"/*.exe \
@@ -45,9 +57,9 @@ done
 shopt -u nullglob
 
 if [ "$copied" -eq 0 ]; then
-  echo "Error: no installer artifacts found in $DIST_DIR" >&2
+  echo "[x] no installer artifacts found in $DIST_DIR" >&2
   exit 1
 fi
 
-echo "==> Done. $copied installer(s) in $INSTALLERS_DIR:"
+echo "[+] Done. $copied installer(s) in $INSTALLERS_DIR:"
 ls -lh "$INSTALLERS_DIR" | awk 'NR>1 {printf "    %-40s %s\n", $9, $5}'

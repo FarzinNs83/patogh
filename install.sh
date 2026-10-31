@@ -1,62 +1,90 @@
 #!/usr/bin/env bash
 # ============================================================
-# Patogh — Production Installer
+#  install.sh -- Patogh on a Linux server with Docker, behind nginx with a
+#                Let's Encrypt certificate, with voice and video (LiveKit)
+#
+#  What it does
+#    1. installs Docker and the compose plugin (from get.docker.com, or from
+#       the distro packages if that is unreachable)
+#    2. checks Docker Hub, npm and Debian; on a server in Iran, where they are
+#       blocked, it finds local mirrors that answer and uses them
+#    3. asks for the domain (only on the first run) and picks the mode:
+#         allinone  the bundled nginx owns 80/443, gets a Let's Encrypt
+#                   certificate and renews it daily (when 80/443 are free)
+#         proxy     you already run a reverse proxy (nginx, Traefik, Caddy,
+#                   Nginx Proxy Manager, ...): Patogh listens on
+#                   127.0.0.1:APP_PORT and ready-to-paste config is printed
+#         tunnel    Cloudflare Tunnel, Tailscale, ...: like proxy, no voice
+#                   (WebRTC/UDP cannot cross a tunnel)
+#    4. writes .env and livekit.yaml (secrets are generated once and kept on
+#       re-runs), pulls the prebuilt image (or builds it from source) and
+#       starts it, then checks that https://<domain> answers
+#
+#  The server's name and owner are not asked here: the first person to open
+#  the site names it on the setup page and becomes its owner. Re-running the
+#  script upgrades the install and keeps its settings.
+#
+#  Usage:
+#    ./install.sh                  (asks for the domain)
+#    ./update.sh                   (later: update to the newest release)
+#
+#  Options: --help
 # ============================================================
-# Sets up Patogh on a Linux server in one of three deployment modes,
-# auto-detecting which one fits your environment:
-#
-#   allinone  The bundled nginx owns ports 80/443; the installer gets a Let's
-#             Encrypt certificate with certbot and schedules its renewal. The
-#             simplest setup — pick this if 80/443 are free.
-#   proxy     You already run a reverse proxy (nginx, Traefik, Caddy, Nginx Proxy
-#             Manager, SWAG…). Patogh is published on 127.0.0.1:APP_PORT and
-#             the installer prints ready-to-paste proxy config. No bundled nginx.
-#   tunnel    You expose the box through a tunnel (Cloudflare Tunnel, Tailscale…).
-#             Same as proxy, plus tunnel-specific guidance. (Voice does not work
-#             over a tunnel — WebRTC/UDP can't traverse it.)
-#
-# Usage:
-#   ./install.sh                    Asks for the domain once; everything else
-#                                   (Docker, mirrors, HTTPS, voice) is automatic.
-#   DOMAIN=chat.example.com ./install.sh    Asks nothing at all.
-#
-#   Optional overrides (none needed normally):
-#     DEPLOY_MODE=allinone|proxy|tunnel   APP_PORT=8080   ENABLE_VOICE=false
-#     CERTBOT_EMAIL=you@example.com       (expiry notices from Let's Encrypt)
-#     DOCKER_MIRRORS="https://a https://b"  NPM_REGISTRY=…  DEBIAN_MIRROR=…
-#
-#   On an Iranian server, blocked downloads (Docker, Docker Hub, npm, Debian)
-#   are detected and routed through local mirrors automatically.
-#
-#   The server's name and owner are not asked here: the first person to open
-#   the site names it on the setup page and becomes its owner.
-#
-#   PATOGH_BUILD=true ./install.sh  Force a local from-source build instead of
-#                                      pulling the prebuilt image (fork operators).
-# ============================================================
+set -Eeuo pipefail
+cd "$(dirname "$0")"
 
-set -euo pipefail
+usage() {
+  cat << 'EOF'
+install.sh -- install Patogh with Docker, behind nginx with a Let's Encrypt
+certificate, with voice and video (LiveKit).
 
-# ── Output helpers ──────────────────────────────────────────
+Usage:
+  ./install.sh                (asks for the domain on the first run)
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
+Everything else is automatic. Optional overrides, as environment variables:
+  DEPLOY_MODE=allinone|proxy|tunnel   default: allinone when 80/443 are free,
+                                      else proxy
+  APP_PORT=<port>                     loopback port in proxy / tunnel mode
+  ENABLE_VOICE=false                  no voice / video (no LiveKit)
+  CERTBOT_EMAIL=<address>             Let's Encrypt expiry notices
+  MAX_UPLOAD_SIZE=<bytes>             upload limit (default: 100 MB)
+  DOCKER_MIRRORS="https://a https://b"
+  NPM_REGISTRY=<url>                  mirrors; found automatically when the
+  DEBIAN_MIRROR=<url>                 originals are blocked
+  PATOGH_BUILD=true                   build from source instead of pulling
+                                      the prebuilt image (forks)
 
-info()    { echo -e "${BLUE}[INFO]${NC} $*"; }
-success() { echo -e "${GREEN}  OK ${NC} $*"; }
-warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
-error()   { echo -e "${RED}[ERR]${NC} $*" >&2; }
+  -h, --help                          show this help
 
-step() {
-  echo ""
-  echo -e "${BOLD}${CYAN}─── $* ───${NC}"
-  echo ""
+After the install (from this directory):
+  ./update.sh                 snapshot the database, update, roll back on failure
+  ./backup.sh                 database snapshot to data/backups/
+  ./restore.sh                list snapshots / restore one
+  docker compose logs -f      logs
+EOF
 }
+
+case "${1:-}" in
+  "") ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  *)
+    printf '[x] Unknown option: %s (try --help).\n' "$1" >&2
+    exit 1
+    ;;
+esac
+
+# -- Output helpers ------------------------------------------
+
+info() { printf '[+] %s\n' "$*"; }
+success() { printf '[+] %s\n' "$*"; }
+warn() { printf '[!] %s\n' "$*" >&2; }
+error() { printf '[x] %s\n' "$*" >&2; }
+step() { printf '\n== %s ==\n\n' "$*"; }
+
+trap 'rc=$?; trap - ERR; printf "\n[x] Install failed at line %s (exit %s).\n" "$LINENO" "$rc" >&2; exit "$rc"' ERR
 
 # Root needs no sudo (and minimal images may not even have it).
 SUDO=""
@@ -66,11 +94,11 @@ SUDO=""
 DOCKER="docker"
 COMPOSE="docker compose"
 
-# ── Phase 1: Prerequisites ─────────────────────────────────
+# -- Phase 1: Prerequisites ---------------------------------
 
 step "Checking prerequisites"
 
-# Must be Linux — host networking (LiveKit) is Linux-only
+# Must be Linux -- host networking (LiveKit) is Linux-only
 if [[ "$(uname -s)" != "Linux" ]]; then
   error "Patogh production deployment requires Linux."
   error "Detected: $(uname -s)"
@@ -81,12 +109,12 @@ success "Linux detected"
 
 # Check Docker
 if ! command -v docker &>/dev/null; then
-  info "Docker is not installed — installing it..."
+  info "Docker is not installed -- installing it..."
   # Docker's own script first. Its download servers refuse Iranian IPs, so on
   # failure fall back to the distribution's packages, which come from the
   # server's own (usually local) apt mirror.
   if ! { curl -fsSL --max-time 30 https://get.docker.com -o /tmp/get-docker.sh && $SUDO sh /tmp/get-docker.sh; }; then
-    warn "Docker's install script is unreachable or failed — using the distribution's packages."
+    warn "Docker's install script is unreachable or failed -- using the distribution's packages."
     if ! command -v apt-get &>/dev/null; then
       error "Could not install Docker automatically. Install Docker Engine with the Compose plugin and re-run."
       exit 1
@@ -131,12 +159,12 @@ if ! $COMPOSE version &>/dev/null 2>&1; then
 fi
 success "Docker Compose $($COMPOSE version --short 2>/dev/null || echo 'installed')"
 
-# ── Mirrors for restricted networks (Iran) ─────────────────
+# -- Mirrors for restricted networks (Iran) -----------------
 # Docker Hub, npm and Debian can be blocked or sanctioned from Iranian servers.
 # Each is tried directly first; only if that fails are local mirrors probed and
 # the ones that answer used. Mirror health changes over time, so they are
 # probed on every run instead of being trusted blindly. Overrides:
-#   DOCKER_MIRRORS="https://a https://b"   NPM_REGISTRY=https://…   DEBIAN_MIRROR=http://…
+#   DOCKER_MIRRORS="https://a https://b"   NPM_REGISTRY=https://...   DEBIAN_MIRROR=http://...
 
 # HTTP status of a URL, or 000 when unreachable. Never fails (safe under set -e).
 # curl prints the status even when it then times out mid-body; a server that
@@ -182,7 +210,7 @@ elif [[ "$(http_code 'https://auth.docker.io/token?service=registry.docker.io&sc
   docker_mirrors=()
   success "Docker Hub is reachable directly"
 else
-  warn "Docker Hub is blocked from this server — looking for a working mirror..."
+  warn "Docker Hub is blocked from this server -- looking for a working mirror..."
   docker_mirrors=()
   for m in "${DOCKER_MIRROR_CANDIDATES[@]}"; do
     code="$(http_code "$m/v2/" 8)"
@@ -241,7 +269,7 @@ if [[ -z "${NPM_REGISTRY:-}" ]]; then
   if [[ "$(http_code https://registry.npmjs.org/isarray)" == "200" ]]; then
     success "npm registry is reachable directly"
   else
-    warn "registry.npmjs.org is blocked — looking for a working npm mirror..."
+    warn "registry.npmjs.org is blocked -- looking for a working npm mirror..."
     for m in "${NPM_CANDIDATES[@]}"; do
       if [[ "$(http_code "${m}isarray" 15)" == "200" ]]; then
         NPM_REGISTRY="$m"
@@ -259,7 +287,7 @@ if [[ -z "${DEBIAN_MIRROR:-}" ]]; then
   if [[ "$(http_code http://deb.debian.org/debian/dists/stable/Release)" == "200" ]]; then
     success "Debian package mirror is reachable directly"
   else
-    warn "deb.debian.org is blocked — looking for a working Debian mirror..."
+    warn "deb.debian.org is blocked -- looking for a working Debian mirror..."
     for m in "${DEBIAN_CANDIDATES[@]}"; do
       if [[ "$(http_code "$m/debian/dists/stable/Release" 15)" == "200" ]]; then
         DEBIAN_MIRROR="$m"
@@ -272,16 +300,16 @@ if [[ -z "${DEBIAN_MIRROR:-}" ]]; then
 fi
 DEBIAN_MIRROR="${DEBIAN_MIRROR:-}"
 
-# ── Port helpers ────────────────────────────────────────────
+# -- Port helpers --------------------------------------------
 # A host port can be held in two ways this installer must detect:
-#   1. A normal listening socket (host process)          → visible via `ss -tln`.
+#   1. A normal listening socket (host process)          -> visible via `ss -tln`.
 #   2. A Docker-published port. With the userland proxy *disabled*
 #      (`userland-proxy: false`, common on tuned hosts), Docker DNATs the port
 #      with iptables and there is NO listening socket for `ss` to see. So we must
-#      also consult `docker ps` — otherwise a box whose nginx already owns 80/443
+#      also consult `docker ps` -- otherwise a box whose nginx already owns 80/443
 #      via iptables would be misreported as "ports free".
 
-# Does any running container publish this host port? (matches "…:<port>->" in the
+# Does any running container publish this host port? (matches "...:<port>->" in the
 # Ports column; the ":" before the port and "->" after pin it to the HOST port,
 # so :80 doesn't match :8080 and never matches the container-side port.)
 docker_publishes_port() {
@@ -289,7 +317,7 @@ docker_publishes_port() {
 }
 
 # Same, but ignore Patogh's own container (used when re-running on a host that
-# already runs this instance — its published port must not count as a conflict).
+# already runs this instance -- its published port must not count as a conflict).
 docker_publishes_port_other() {
   $DOCKER ps --format '{{.Names}} {{.Ports}}' 2>/dev/null \
     | grep -vE '^patogh ' | grep -qE ":${1}->"
@@ -327,7 +355,7 @@ port_holder() {
   echo "${holder:-another process}"
 }
 
-# ── openssl (needed for secret generation) ──────────────────
+# -- openssl (needed for secret generation) ------------------
 if ! command -v openssl &>/dev/null; then
   error "openssl is required for generating secrets."
   error "Install: sudo apt-get install openssl"
@@ -343,13 +371,13 @@ else
   success "Disk space OK"
 fi
 
-# ── Phase 2: Configuration ─────────────────────────────────
+# -- Phase 2: Configuration ---------------------------------
 
 step "Configuration"
 
 # Detect existing installation
 if [[ -f .env ]]; then
-  info "Existing .env detected — secrets and settings will be preserved."
+  info "Existing .env detected -- secrets and settings will be preserved."
 fi
 
 # Helper: read existing .env value (|| true prevents set -e from killing
@@ -360,7 +388,7 @@ env_val() {
   fi
 }
 
-# ── Deployment mode ─────────────────────────────────────────
+# -- Deployment mode -----------------------------------------
 # Chosen without asking: an explicit DEPLOY_MODE wins, then the existing .env,
 # then All-in-One when ports 80/443 are free (or held by our own nginx).
 # If something else owns them, fall back to proxy mode behind it.
@@ -387,8 +415,8 @@ elif [[ "$NGINX_RUNNING" == true || ( "$port80_free" == true && "$port443_free" 
 else
   DEPLOY_MODE=proxy
   warn "Ports 80/443 are in use on this host:"
-  [[ "$port80_free"  == false ]] && warn "  80  → held by $(port_holder 80)"
-  [[ "$port443_free" == false ]] && warn "  443 → held by $(port_holder 443)"
+  [[ "$port80_free"  == false ]] && warn "  80  -> held by $(port_holder 80)"
+  [[ "$port443_free" == false ]] && warn "  443 -> held by $(port_holder 443)"
   warn "Using proxy mode: point your existing reverse proxy at Patogh (config printed at the end)."
   warn "To get the fully automatic setup instead, free 80/443 and re-run with DEPLOY_MODE=allinone."
 fi
@@ -401,7 +429,7 @@ case "$DEPLOY_MODE" in
     ;;
 esac
 
-# All-in-One requires 80/443 — but a re-run over an existing All-in-One instance
+# All-in-One requires 80/443 -- but a re-run over an existing All-in-One instance
 # legitimately finds *its own* nginx holding them (an upgrade), which is fine.
 if [[ "$DEPLOY_MODE" == "allinone" ]]; then
   if [[ "$NGINX_RUNNING" == true ]]; then
@@ -419,7 +447,7 @@ fi
 
 # In proxy/tunnel mode, layer the proxy override so nginx is dropped and the app
 # is published on a loopback port. Compose reads COMPOSE_FILE (from the shell and
-# from .env) to pick up both files for every command — the operator never needs
+# from .env) to pick up both files for every command -- the operator never needs
 # to remember `-f` flags afterwards.
 if [[ "$DEPLOY_MODE" == "proxy" || "$DEPLOY_MODE" == "tunnel" ]]; then
   export COMPOSE_FILE="docker-compose.yml:docker-compose.proxy.yml"
@@ -427,7 +455,7 @@ else
   unset COMPOSE_FILE 2>/dev/null || true
 fi
 
-# ── Domain ──────────────────────────────────────────────────
+# -- Domain --------------------------------------------------
 # Required in every mode: it's the public hostname clients use and it drives the
 # federation identity + LiveKit URL. In proxy/tunnel mode TLS is terminated at
 # your edge, but the app still advertises https://DOMAIN.
@@ -477,7 +505,7 @@ fi
 
 # DNS verification is meaningful for All-in-One (Let's Encrypt must reach this host to
 # issue a certificate). In proxy/tunnel mode the DNS record points at your proxy
-# or tunnel edge — often NOT this host's IP (that's the whole point) — so we only
+# or tunnel edge -- often NOT this host's IP (that's the whole point) -- so we only
 # note what it resolves to, without warning about a mismatch.
 info "Checking DNS for ${DOMAIN_HOST}..."
 resolved_ip=""
@@ -511,11 +539,11 @@ else
   if [[ -n "$resolved_ip" ]]; then
     info "${DOMAIN_HOST} currently resolves to ${resolved_ip} (should point at your proxy/tunnel edge)."
   else
-    info "${DOMAIN_HOST} does not resolve yet — point it at your proxy/tunnel edge when ready."
+    info "${DOMAIN_HOST} does not resolve yet -- point it at your proxy/tunnel edge when ready."
   fi
 fi
 
-# ── App port (proxy / tunnel only) ──────────────────────────
+# -- App port (proxy / tunnel only) --------------------------
 # The loopback host port your proxy/tunnel forwards to. Auto-picked to avoid
 # common clashes (3000/8080 are frequently taken) unless APP_PORT is set.
 
@@ -550,15 +578,15 @@ if [[ "$DEPLOY_MODE" == "proxy" || "$DEPLOY_MODE" == "tunnel" ]]; then
   success "App will be published on 127.0.0.1:${APP_PORT_FINAL}"
 fi
 
-# ── Voice/Video ─────────────────────────────────────────────
+# -- Voice/Video ---------------------------------------------
 # Voice needs open UDP media ports and (in proxy mode) a /livekit route. Over a
-# tunnel, WebRTC/UDP cannot traverse the edge at all — so voice is force-disabled
+# tunnel, WebRTC/UDP cannot traverse the edge at all -- so voice is force-disabled
 # in tunnel mode rather than silently configured and then failing at call time.
 
 existing_profiles=$(env_val COMPOSE_PROFILES)
 if [[ "$DEPLOY_MODE" == "tunnel" ]]; then
   if [[ "${ENABLE_VOICE:-}" == "true" ]]; then
-    warn "Voice cannot work over a tunnel (WebRTC/UDP can't traverse it) — disabling it."
+    warn "Voice cannot work over a tunnel (WebRTC/UDP can't traverse it) -- disabling it."
   fi
   ENABLE_VOICE=false
   info "Voice/video is disabled in tunnel mode (a known, unavoidable limitation)."
@@ -574,13 +602,13 @@ if [[ "$ENABLE_VOICE" == true && "$DEPLOY_MODE" == "proxy" ]]; then
   info "Voice needs open UDP media ports AND a /livekit route in your proxy (snippet printed at the end)."
 fi
 
-# ── Certificate email (All-in-One only) ─────────────────────
+# -- Certificate email (All-in-One only) ---------------------
 # Let's Encrypt mails expiry warnings here if renewal ever stops working.
-# Optional and never asked: pass CERTBOT_EMAIL=… to set one.
+# Optional and never asked: pass CERTBOT_EMAIL=... to set one.
 
 CERTBOT_EMAIL="${CERTBOT_EMAIL:-$(env_val CERTBOT_EMAIL)}"
 
-# ── Max upload size ─────────────────────────────────────────
+# -- Max upload size -----------------------------------------
 # Cloudflare (free/pro) hard-caps request bodies at 100MB, so a 100MB app limit
 # lets uploads fail at the edge instead of in-app. In tunnel mode we default the
 # cap below that (90MB) with headroom for multipart overhead. An explicit
@@ -591,12 +619,12 @@ if [[ -n "${MAX_UPLOAD_SIZE:-}" ]]; then
 elif [[ -n "$existing_max" ]]; then
   MAX_UPLOAD_SIZE="$existing_max"
 elif [[ "$DEPLOY_MODE" == "tunnel" ]]; then
-  MAX_UPLOAD_SIZE=94371840   # 90 MB — under Cloudflare's 100MB body cap
+  MAX_UPLOAD_SIZE=94371840   # 90 MB -- under Cloudflare's 100MB body cap
 else
   MAX_UPLOAD_SIZE=104857600  # 100 MB
 fi
 
-# ── Trusted proxy hops ──────────────────────────────────────
+# -- Trusted proxy hops --------------------------------------
 # The number of proxies in front of the app that may be trusted to have written
 # X-Forwarded-For. Every rate limit keys on the address it produces. All three
 # deployment modes are one hop, which is the app's default, so this is written
@@ -608,7 +636,7 @@ fi
 existing_hops=$(env_val TRUSTED_PROXY_HOPS)
 TRUSTED_PROXY_HOPS="${TRUSTED_PROXY_HOPS:-${existing_hops}}"
 
-# ── Phase 3: Generate Secrets ───────────────────────────────
+# -- Phase 3: Generate Secrets -------------------------------
 
 step "Generating configuration"
 
@@ -638,11 +666,11 @@ if [[ "$ENABLE_VOICE" == true ]]; then
   fi
 fi
 
-# ── Phase 4: Write Configuration Files ─────────────────────
+# -- Phase 4: Write Configuration Files ---------------------
 
 step "Writing configuration files"
 
-# ── .env ────────────────────────────────────────────────────
+# -- .env ----------------------------------------------------
 
 {
   cat << EOF
@@ -670,7 +698,7 @@ EOF
 # Reverse-proxy / tunnel mode: layer the proxy override so the bundled nginx is
 # dropped and the app is published on 127.0.0.1:APP_PORT for your edge to reach.
 # COMPOSE_FILE makes every 'docker compose' command in this directory use both
-# files automatically — no -f flags needed.
+# files automatically -- no -f flags needed.
 COMPOSE_FILE=docker-compose.yml:docker-compose.proxy.yml
 APP_PORT=${APP_PORT_FINAL}
 EOF
@@ -750,7 +778,7 @@ EOF
 
 success ".env"
 
-# ── livekit.yaml ────────────────────────────────────────────
+# -- livekit.yaml --------------------------------------------
 
 # Always generate livekit.yaml so docker-compose config doesn't complain
 # about a missing bind mount if someone inspects the full compose file.
@@ -800,15 +828,15 @@ keys: {}
 logging:
   level: info
 EOF
-  info "livekit.yaml (placeholder — voice disabled)"
+  info "livekit.yaml (placeholder -- voice disabled)"
 fi
 
-# ── Data directory ──────────────────────────────────────────
+# -- Data directory ------------------------------------------
 
 mkdir -p ./data/uploads
 success "data/"
 
-# ── Phase 5: TLS certificate (All-in-One only) ─────────────
+# -- Phase 5: TLS certificate (All-in-One only) -------------
 # nginx serves HTTPS from /etc/letsencrypt but cannot obtain a certificate
 # itself, and will not start without one. So the first certificate is issued
 # here with certbot's standalone server while port 80 is still free, and
@@ -856,15 +884,15 @@ if [[ "$DEPLOY_MODE" == "allinone" ]]; then
   fi
 fi
 
-# ── Phase 6: Build & Deploy ────────────────────────────────
+# -- Phase 6: Build & Deploy --------------------------------
 
 step "Deploying Patogh"
 
-# AGPL-3.0 § 13 source offer: bake the running build's git commit into the image
+# AGPL-3.0 section 13 source offer: bake the running build's git commit into the image
 # so GET /api/instance/info advertises the exact source version. Passed straight
 # to the build as --build-arg (survives the sudo/non-sudo $COMPOSE split, unlike
 # an exported env var). Empty when this isn't a git checkout (e.g. tarball
-# install) or git is unavailable → the server treats the commit as null. A pulled
+# install) or git is unavailable -> the server treats the commit as null. A pulled
 # prebuilt image already carries the commit baked at CI build time.
 BUILD_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo '')"
 
@@ -880,7 +908,7 @@ build_from_source() {
 # Default path: pull the prebuilt multi-arch image (fast, and it spares weak/ARM
 # hosts the ~1.6GB local build that OOMs small boxes). Fall back to a from-source
 # build if the image can't be pulled (not published yet, private, or offline), or
-# if the operator forces a build (PATOGH_BUILD=true — e.g. running a fork).
+# if the operator forces a build (PATOGH_BUILD=true -- e.g. running a fork).
 # Records which path this install actually took, so the admin Updates panel can
 # say which it is.
 # Written *after* the decision resolves rather than alongside the rest of .env,
@@ -912,7 +940,7 @@ EOF
 }
 
 if [[ "${PATOGH_BUILD:-false}" == "true" ]]; then
-  info "PATOGH_BUILD=true — building from source (skipping the prebuilt image)."
+  info "PATOGH_BUILD=true -- building from source (skipping the prebuilt image)."
   build_from_source
   record_install_channel source
 else
@@ -922,7 +950,7 @@ else
   # The Docker Hub mirrors above do not cover other registries; when this one is
   # blocked, skip a pull that would only hang and build instead.
   if [[ "$registry_code" != "200" && "$registry_code" != "401" ]]; then
-    warn "${registry_host} is unreachable from this server — skipping the prebuilt image."
+    warn "${registry_host} is unreachable from this server -- skipping the prebuilt image."
   else
     info "Fetching prebuilt image ${image_ref} ..."
   fi
@@ -932,13 +960,13 @@ else
   elif $DOCKER image inspect "$image_ref" >/dev/null 2>&1; then
     # Pull failed (offline / registry hiccup / private) but a usable copy is
     # already on this host (a prior run, an air-gapped `docker load`, or a
-    # previous from-source build tagged under this ref) — use it instead of
+    # previous from-source build tagged under this ref) -- use it instead of
     # forcing a needless multi-hundred-MB rebuild.
-    warn "Could not pull ${image_ref} — using the copy already present on this host."
+    warn "Could not pull ${image_ref} -- using the copy already present on this host."
     record_install_channel prebuilt
   else
     warn "Prebuilt image unavailable (not published yet, private, or offline)."
-    warn "Falling back to a from-source build — slower, and heavy on low-RAM/ARM hosts."
+    warn "Falling back to a from-source build -- slower, and heavy on low-RAM/ARM hosts."
     build_from_source
     record_install_channel source
   fi
@@ -965,11 +993,11 @@ else
   warn "Health check hasn't passed yet. Check logs: docker compose logs patogh"
 fi
 
-# ── Phase 7: Post-deploy reachability check ────────────────
+# -- Phase 7: Post-deploy reachability check ----------------
 # What's verifiable differs by mode:
-#   allinone      → prove https://DOMAIN works end-to-end (nginx serves a valid,
+#   allinone      -> prove https://DOMAIN works end-to-end (nginx serves a valid,
 #                   publicly-trusted certificate AND the app answers over it).
-#   proxy/tunnel  → prove the app answers on its loopback port (your edge then
+#   proxy/tunnel  -> prove the app answers on its loopback port (your edge then
 #                   fronts it); TLS is your proxy/tunnel's job, not ours to test.
 
 https_status="skipped"
@@ -981,7 +1009,7 @@ if [[ "$DEPLOY_MODE" == "allinone" ]]; then
     https_status="pending"
     # `curl --resolve DOMAIN:443:127.0.0.1` connects to the LOCAL nginx but
     # presents the real SNI/Host and does full certificate verification. A pass
-    # proves a valid public cert is installed AND the app answers over it — and
+    # proves a valid public cert is installed AND the app answers over it -- and
     # it's hairpin-safe (many self-hosted boxes can't reach their own public IP).
     info "Checking HTTPS on ${DOMAIN}..."
     for i in $(seq 1 15); do
@@ -992,9 +1020,9 @@ if [[ "$DEPLOY_MODE" == "allinone" ]]; then
       sleep 2
     done
     if [[ "$https_status" == "live" ]]; then
-      success "HTTPS is live — a valid TLS certificate is installed and Patogh is serving over it."
+      success "HTTPS is live -- a valid TLS certificate is installed and Patogh is serving over it."
     else
-      warn "HTTPS is not answering yet — check: docker compose logs nginx"
+      warn "HTTPS is not answering yet -- check: docker compose logs nginx"
     fi
   fi
 else
@@ -1009,20 +1037,20 @@ else
       sleep 1
     done
     if [[ "$app_reachable" == "yes" ]]; then
-      success "Patogh is answering on http://127.0.0.1:${APP_PORT_FINAL} — point your $( [[ "$DEPLOY_MODE" == tunnel ]] && echo tunnel || echo 'reverse proxy') at it."
+      success "Patogh is answering on http://127.0.0.1:${APP_PORT_FINAL} -- point your $( [[ "$DEPLOY_MODE" == tunnel ]] && echo tunnel || echo 'reverse proxy') at it."
     else
-      warn "Could not reach http://127.0.0.1:${APP_PORT_FINAL}/api/health yet — check: docker compose logs patogh"
+      warn "Could not reach http://127.0.0.1:${APP_PORT_FINAL}/api/health yet -- check: docker compose logs patogh"
     fi
   fi
 fi
 
-# ── Reverse-proxy / tunnel snippet generators ──────────────
+# -- Reverse-proxy / tunnel snippet generators --------------
 # Paste-ready configs with WebSocket upgrade, X-Forwarded-*, and a body-size cap
 # already correct. Printed for proxy/tunnel modes so the operator's edge routes
-# to 127.0.0.1:APP_PORT (and, if voice is on, /livekit → the host LiveKit).
+# to 127.0.0.1:APP_PORT (and, if voice is on, /livekit -> the host LiveKit).
 
-hr()   { echo -e "${CYAN}────────────────────────────────────────────────────────────${NC}"; }
-snip() { echo -e "${BOLD}$*${NC}"; }
+hr()   { echo "------------------------------------------------------------"; }
+snip() { echo "$*"; }
 
 # Body-size cap in the proxy should match the app's MAX_UPLOAD_SIZE. Express it in
 # MB for the human-facing proxy directives (round up so the proxy never rejects a
@@ -1030,7 +1058,7 @@ snip() { echo -e "${BOLD}$*${NC}"; }
 max_mb=$(( (MAX_UPLOAD_SIZE + 1048575) / 1048576 ))
 
 print_nginx_snippet() {
-  snip "nginx  — add the map once inside http { }, then a server block:"
+  snip "nginx  -- add the map once inside http { }, then a server block:"
   hr
   cat << EOF
 # --- inside http { } (once) --------------------------------
@@ -1052,7 +1080,7 @@ EOF
   if [[ "$ENABLE_VOICE" == true ]]; then
     cat << EOF
 
-    # Voice signaling → host-networked LiveKit (strips the /livekit prefix):
+    # Voice signaling -> host-networked LiveKit (strips the /livekit prefix):
     location /livekit/ {
         proxy_pass http://127.0.0.1:7880/;
         proxy_http_version 1.1;
@@ -1088,7 +1116,7 @@ EOF
 }
 
 print_caddy_snippet() {
-  snip "Caddy  — if you run your OWN Caddy (it auto-handles WebSocket + HTTPS):"
+  snip "Caddy  -- if you run your OWN Caddy (it auto-handles WebSocket + HTTPS):"
   hr
   cat << EOF
 ${DOMAIN} {
@@ -1117,7 +1145,7 @@ EOF
 }
 
 print_traefik_snippet() {
-  snip "Traefik — dynamic (file-provider) config; Traefik handles WebSocket itself:"
+  snip "Traefik -- dynamic (file-provider) config; Traefik handles WebSocket itself:"
   hr
   cat << EOF
 http:
@@ -1164,7 +1192,7 @@ EOF
 }
 
 print_tunnel_snippet() {
-  snip "Cloudflare Tunnel — ingress rule (cloudflared config.yml):"
+  snip "Cloudflare Tunnel -- ingress rule (cloudflared config.yml):"
   hr
   cat << EOF
 tunnel: <YOUR-TUNNEL-ID>
@@ -1177,58 +1205,58 @@ ingress:
 EOF
   hr
   echo "  Then map the hostname to the tunnel (once):"
-  echo -e "    ${BOLD}cloudflared tunnel route dns <YOUR-TUNNEL-ID> ${DOMAIN}${NC}"
+  echo "    cloudflared tunnel route dns <YOUR-TUNNEL-ID> ${DOMAIN}"
 }
 
-# ── Phase 8: Summary ───────────────────────────────────────
+# -- Phase 8: Summary ---------------------------------------
 
 step "Patogh is running"
 
-echo -e "  ${BOLD}URL:${NC}       https://${DOMAIN}"
-echo -e "  ${BOLD}Mode:${NC}      ${DEPLOY_MODE}"
-echo -e "  ${BOLD}Voice:${NC}     $(if [[ "$ENABLE_VOICE" == true ]]; then echo 'Enabled'; else echo 'Disabled'; fi)"
+echo "  URL:       https://${DOMAIN}"
+echo "  Mode:      ${DEPLOY_MODE}"
+echo "  Voice:     $(if [[ "$ENABLE_VOICE" == true ]]; then echo 'Enabled'; else echo 'Disabled'; fi)"
 
 if [[ "$DEPLOY_MODE" == "allinone" ]]; then
   case "$https_status" in
-    live)    echo -e "  ${BOLD}HTTPS:${NC}     ${GREEN}Live${NC}" ;;
-    pending) echo -e "  ${BOLD}HTTPS:${NC}     ${YELLOW}Not live yet${NC}" ;;
+    live)    echo "  HTTPS:     Live" ;;
+    pending) echo "  HTTPS:     Not live yet" ;;
   esac
   echo ""
   if [[ "$https_status" == "pending" ]]; then
-    echo -e "  ${YELLOW}The app is up, but HTTPS isn't answering yet. Check that port 443 is open${NC}"
-    echo -e "  ${YELLOW}to this host, then look at:${NC} ${BOLD}docker compose logs -f nginx${NC}"
+    echo "  The app is up, but HTTPS isn't answering yet. Check that port 443 is open"
+    echo "  to this host, then look at: docker compose logs -f nginx"
     echo ""
   fi
-  echo -e "  ${YELLOW}Open https://${DOMAIN} to set up the server: you name it and become its owner.${NC}"
-  echo -e "  Certificate renewal runs daily from /etc/cron.d/patogh-certbot (./renew-cert.sh)."
+  echo "  Open https://${DOMAIN} to set up the server: you name it and become its owner."
+  echo "  Certificate renewal runs daily from /etc/cron.d/patogh-certbot (./renew-cert.sh)."
 
   echo ""
   # Best-effort primary LAN IP (the address a router would port-forward to).
   LAN_IP=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' | head -1 || true)
-  echo -e "  ${BOLD}Ports to open${NC} — on this host's firewall (ufw / firewalld / cloud"
-  echo -e "  security group)${BOLD} and,${NC} if the host is behind a router, also"
-  echo -e "  port-forward them to this host${LAN_IP:+ (${LAN_IP})}:"
+  echo "  Ports to open -- on this host's firewall (ufw / firewalld / cloud"
+  echo "  security group) and, if the host is behind a router, also"
+  echo "  port-forward them to this host${LAN_IP:+ (${LAN_IP})}:"
   echo ""
-  echo "    80/TCP            HTTP  — cert challenge + HTTP→HTTPS redirect      (required)"
-  echo "    443/TCP           HTTPS — web app, API, WebSocket, LiveKit signal   (required)"
+  echo "    80/TCP            HTTP  -- cert challenge + HTTP->HTTPS redirect      (required)"
+  echo "    443/TCP           HTTPS -- web app, API, WebSocket, LiveKit signal   (required)"
   if [[ "$ENABLE_VOICE" == true ]]; then
-    echo "    3478/UDP          TURN  — WebRTC NAT traversal                       (voice)"
+    echo "    3478/UDP          TURN  -- WebRTC NAT traversal                       (voice)"
     echo "    7881/TCP          WebRTC TCP fallback                              (voice)"
-    echo "    50000-60000/UDP   WebRTC media — voice / video / screen-share      (voice)"
+    echo "    50000-60000/UDP   WebRTC media -- voice / video / screen-share      (voice)"
   fi
   echo ""
-  echo -e "  ${YELLOW}80 and 443 must be reachable from the internet before HTTPS can come up.${NC}"
+  echo "  80 and 443 must be reachable from the internet before HTTPS can come up."
   if [[ "$ENABLE_VOICE" == true ]]; then
-    echo -e "  ${YELLOW}Voice/video won't connect until the voice ports above are reachable too.${NC}"
+    echo "  Voice/video won't connect until the voice ports above are reachable too."
   fi
-  echo -e "  LiveKit's own signaling port (7880) stays internal — do ${BOLD}not${NC} forward it."
+  echo "  LiveKit's own signaling port (7880) stays internal -- do not forward it."
 
 elif [[ "$DEPLOY_MODE" == "proxy" ]]; then
   echo ""
-  echo -e "  Patogh listens on ${BOLD}127.0.0.1:${APP_PORT_FINAL}${NC} (loopback only — never expose it directly)."
-  echo -e "  Point your reverse proxy at it, then open ${BOLD}https://${DOMAIN}${NC} to set up the server (you become its owner)."
+  echo "  Patogh listens on 127.0.0.1:${APP_PORT_FINAL} (loopback only -- never expose it directly)."
+  echo "  Point your reverse proxy at it, then open https://${DOMAIN} to set up the server (you become its owner)."
   echo ""
-  echo -e "  ${BOLD}Paste one of these into your reverse proxy${NC} (WebSocket, X-Forwarded-*, and body cap already set):"
+  echo "  Paste one of these into your reverse proxy (WebSocket, X-Forwarded-*, and body cap already set):"
   echo ""
   print_nginx_snippet
   echo ""
@@ -1236,35 +1264,38 @@ elif [[ "$DEPLOY_MODE" == "proxy" ]]; then
   echo ""
   print_traefik_snippet
   echo ""
-  echo -e "  ${BOLD}Nginx Proxy Manager / other GUI proxies:${NC} forward to 127.0.0.1:${APP_PORT_FINAL},"
-  echo -e "  enable 'Websockets Support', and set client_max_body_size ${max_mb}m in the Advanced tab."
+  echo "  Nginx Proxy Manager / other GUI proxies: forward to 127.0.0.1:${APP_PORT_FINAL},"
+  echo "  enable 'Websockets Support', and set client_max_body_size ${max_mb}m in the Advanced tab."
   if [[ "$ENABLE_VOICE" == true ]]; then
     echo ""
-    echo -e "  ${YELLOW}Voice is enabled — in addition to the /livekit route above, open these UDP/TCP${NC}"
-    echo -e "  ${YELLOW}media ports on the firewall and forward them to this host:${NC}"
-    echo "    3478/UDP          TURN  — WebRTC NAT traversal"
+    echo "  Voice is enabled -- in addition to the /livekit route above, open these UDP/TCP"
+    echo "  media ports on the firewall and forward them to this host:"
+    echo "    3478/UDP          TURN  -- WebRTC NAT traversal"
     echo "    7881/TCP          WebRTC TCP fallback"
-    echo "    50000-60000/UDP   WebRTC media — voice / video / screen-share"
-    echo -e "  ${YELLOW}Media flows host→client directly, NOT through your reverse proxy.${NC}"
+    echo "    50000-60000/UDP   WebRTC media -- voice / video / screen-share"
+    echo "  Media flows host->client directly, NOT through your reverse proxy."
   fi
 
 elif [[ "$DEPLOY_MODE" == "tunnel" ]]; then
   echo ""
-  echo -e "  Patogh listens on ${BOLD}127.0.0.1:${APP_PORT_FINAL}${NC} (loopback only). Your tunnel fronts it."
-  echo -e "  Once the ingress rule is live, open ${BOLD}https://${DOMAIN}${NC} to set up the server (you become its owner)."
+  echo "  Patogh listens on 127.0.0.1:${APP_PORT_FINAL} (loopback only). Your tunnel fronts it."
+  echo "  Once the ingress rule is live, open https://${DOMAIN} to set up the server (you become its owner)."
   echo ""
   print_tunnel_snippet
   echo ""
-  echo -e "  ${YELLOW}Upload cap:${NC} MAX_UPLOAD_SIZE is set to ${max_mb}MB to stay under Cloudflare's 100MB"
-  echo -e "  request-body limit. Raising it above ~100MB will make large uploads fail at the edge."
+  echo "  Upload cap: MAX_UPLOAD_SIZE is set to ${max_mb}MB to stay under Cloudflare's 100MB"
+  echo "  request-body limit. Raising it above ~100MB will make large uploads fail at the edge."
   echo ""
-  echo -e "  ${YELLOW}Voice/video is not available over a tunnel${NC} — WebRTC/UDP media can't traverse it."
-  echo -e "  If you need voice, run Patogh behind a reverse proxy (proxy mode) with the"
-  echo -e "  media ports opened, or use All-in-One with ports 80/443."
+  echo "  Voice/video is not available over a tunnel -- WebRTC/UDP media can't traverse it."
+  echo "  If you need voice, run Patogh behind a reverse proxy (proxy mode) with the"
+  echo "  media ports opened, or use All-in-One with ports 80/443."
 fi
 
 echo ""
-echo -e "  ${BOLD}Commands${NC} (run from this directory):"
+echo "  Commands (run from this directory):"
+echo "    ./update.sh                     # Update (snapshot first, rolls back on failure)"
+echo "    ./backup.sh                     # Database snapshot to data/backups/"
+echo "    ./restore.sh                    # List / restore snapshots"
 echo "    docker compose logs -f          # Watch logs"
 echo "    docker compose restart          # Restart all services"
 echo "    docker compose down             # Stop everything"

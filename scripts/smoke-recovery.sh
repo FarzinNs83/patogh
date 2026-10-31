@@ -4,11 +4,11 @@
 # Covers scenarios that don't require GUI interaction or sudo.
 #
 # Automated scenarios (this script):
-#   2   bad URL → load-failed recovery
-#   4   boot stall (static page that never pings) → renderer-stalled recovery
+#   2   bad URL -> load-failed recovery
+#   4   boot stall (static page that never pings) -> renderer-stalled recovery
 #   13  positive control: rendererReady ping disarms boot timer (no recovery)
 #
-# Manual scenarios (run yourself in front of the UI — see spec §9):
+# Manual scenarios (run yourself in front of the UI -- see spec section9):
 #   1   network failure (needs sudo to toggle Wi-Fi)
 #   3   renderer crash via DevTools (process.crash())
 #   5,6 native notification visible/not-visible (OS-level rendering)
@@ -25,13 +25,13 @@
 #   pointed at via PATOGH_URL. This bypasses the need to build a stalled web
 #   bundle: scenario 4 omits the rendererReady call; scenario 13 includes it.
 # - Scenario 2 writes a bad URL to instance-url.json and lets the normal load
-#   path fail (did-fail-load → load-failed recovery).
+#   path fail (did-fail-load -> load-failed recovery).
 # - All scenarios grep stderr for [recovery] entered: ... lines emitted by
 #   enterRecoveryMode in recovery.ts.
 
 set -euo pipefail
 
-# ─── Config ──────────────────────────────────────────────────────────────
+# --- Config ------------------------------------------------------------
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_BINARY="$REPO_ROOT/packages/desktop/dist-electron/mac-arm64/Patogh.app/Contents/MacOS/Patogh"
 USER_DATA_DIR="$HOME/Library/Application Support/Patogh"
@@ -43,14 +43,14 @@ trap 'cleanup' EXIT INT TERM
 SKIP_BUILD=0
 [[ "${1:-}" == "--skip-build" ]] && SKIP_BUILD=1
 
-# ─── Utilities ──────────────────────────────────────────────────────────
+# --- Utilities ----------------------------------------------------------
 declare -i PASS=0
 declare -i FAIL=0
 declare -a RESULTS=()
 
 log() { printf '\n\033[1;36m[smoke]\033[0m %s\n' "$*"; }
-ok()  { printf '  \033[1;32m✓\033[0m %s\n' "$*"; PASS=$((PASS+1)); RESULTS+=("PASS: $*"); }
-bad() { printf '  \033[1;31m✗\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); RESULTS+=("FAIL: $*"); }
+ok()  { printf '  \033[1;32mOK\033[0m %s\n' "$*"; PASS=$((PASS+1)); RESULTS+=("PASS: $*"); }
+bad() { printf '  \033[1;31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); RESULTS+=("FAIL: $*"); }
 
 cleanup() {
   # Always restore the user's instance-url.json if we backed it up
@@ -127,9 +127,9 @@ kill_app() {
   kill -9 "$pid" 2>/dev/null || true
 }
 
-# ─── Scenario helpers ──────────────────────────────────────────────────
+# --- Scenario helpers --------------------------------------------------
 scenario_2_bad_url() {
-  log "Scenario 2: Bad instance URL → recovery (load-failed)"
+  log "Scenario 2: Bad instance URL -> recovery (load-failed)"
   backup_instance_url
   write_bad_instance_url
 
@@ -157,13 +157,13 @@ scenario_2_bad_url() {
 }
 
 scenario_4_boot_stall() {
-  log "Scenario 4: Boot stall → recovery (renderer-stalled)"
+  log "Scenario 4: Boot stall -> recovery (renderer-stalled)"
   log "Strategy: serve a tiny static HTML page locally that has no window.patogh"
-  log "  integration → renderer loads but never pings → 20s → boot timer fires."
+  log "  integration -> renderer loads but never pings -> 20s -> boot timer fires."
 
   # The desktop loads remote URLs via mainWindow.loadURL. Setting PATOGH_URL
   # at launch overrides the saved instance URL. We serve a minimal HTML page
-  # that doesn't import the web bundle at all — guaranteed to never call
+  # that doesn't import the web bundle at all -- guaranteed to never call
   # rendererReady(). No web/desktop rebuilds needed.
   local stall_dir="$TMP_DIR/stall-page"
   mkdir -p "$stall_dir"
@@ -219,7 +219,7 @@ HTML
 
 scenario_13_ping_disarms_timer() {
   log "Scenario 13 (positive control): rendererReady ping disarms the boot timer"
-  log "Strategy: serve a page that DOES call window.patogh.rendererReady() →"
+  log "Strategy: serve a page that DOES call window.patogh.rendererReady() ->"
   log "  verify NO recovery entry within 25s (timer correctly disarmed)."
 
   local ready_dir="$TMP_DIR/ready-page"
@@ -230,7 +230,7 @@ scenario_13_ping_disarms_timer() {
 <head><meta charset="utf-8"><title>Boot Ready Test</title></head>
 <body style="background:#13131a;color:#efefef;font-family:sans-serif;padding:2rem;">
   <h1>Boot ready test page</h1>
-  <p>Renderer calls window.patogh.rendererReady() — the main-process
+  <p>Renderer calls window.patogh.rendererReady() -- the main-process
      boot timer should be disarmed; recovery must NOT enter.</p>
   <script>
     // Marker fetches let the smoke harness verify each branch via the http.server log.
@@ -282,15 +282,15 @@ HTML
   PATOGH_URL="http://127.0.0.1:$port/" "$APP_BINARY" > "$logfile" 2>&1 &
   local pid=$!
 
-  log "  Waiting 25s — boot timer must NOT fire (negative assertion)..."
+  log "  Waiting 25s -- boot timer must NOT fire (negative assertion)..."
   sleep 25
 
   if assert_no_log "$logfile" '\[recovery\] entered:'; then
     ok "Scenario 13: boot timer correctly disarmed by rendererReady ping"
   else
     bad "Scenario 13: recovery entered despite rendererReady ping (boot timer not disarmed)"
-    log "Diagnostic — what the page script did (from httpd.log):"
-    grep -E 'GET /_marker_' "$TMP_DIR/httpd13.log" 2>/dev/null || log "  (no markers — script did not run at all)"
+    log "Diagnostic -- what the page script did (from httpd.log):"
+    grep -E 'GET /_marker_' "$TMP_DIR/httpd13.log" 2>/dev/null || log "  (no markers -- script did not run at all)"
     log "Last 20 lines of app log:"
     tail -n 20 "$logfile" || true
   fi
@@ -300,9 +300,9 @@ HTML
   wait "$httpd_pid" 2>/dev/null || true
 }
 
-# ─── Main ───────────────────────────────────────────────────────────────
+# --- Main ------------------------------------------------------------
 main() {
-  log "Patogh Recovery Mode — Automated Smoke Tests"
+  log "Patogh Recovery Mode -- Automated Smoke Tests"
   log "Repo: $REPO_ROOT"
   log "Tmp:  $TMP_DIR"
 
@@ -324,13 +324,13 @@ main() {
   scenario_4_boot_stall
   scenario_13_ping_disarms_timer
 
-  log "─── Summary ─────────────────────────────────────────────────────"
+  log "--- Summary -----------------------------------------------------"
   local r
   for r in "${RESULTS[@]}"; do
     if [[ "$r" == PASS:* ]]; then
-      printf '  \033[1;32m✓\033[0m %s\n' "${r#PASS: }"
+      printf '  \033[1;32mOK\033[0m %s\n' "${r#PASS: }"
     else
-      printf '  \033[1;31m✗\033[0m %s\n' "${r#FAIL: }"
+      printf '  \033[1;31mFAIL\033[0m %s\n' "${r#FAIL: }"
     fi
   done
   log "$PASS passed, $FAIL failed"

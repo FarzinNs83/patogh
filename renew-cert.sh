@@ -1,9 +1,31 @@
 #!/usr/bin/env bash
-# Renew the Let's Encrypt certificate (All-in-One mode) and reload nginx.
-# install.sh schedules this daily in /etc/cron.d/patogh-certbot. certbot only
-# renews within 30 days of expiry, so most runs change nothing.
-set -euo pipefail
+# =============================================================================
+#  renew-cert.sh -- renew the Let's Encrypt certificate (allinone mode) and
+#                   reload nginx
+#
+#  install.sh runs it daily from /etc/cron.d/patogh-certbot. certbot only
+#  renews within 30 days of expiry, so most runs change nothing.
+#
+#  Usage:
+#    ./renew-cert.sh
+#
+#  Options: --help
+# =============================================================================
+set -Eeuo pipefail
 cd "$(dirname "$0")"
+
+case "${1:-}" in
+  "") ;;
+  -h | --help)
+    printf '%s\n' "renew-cert.sh -- renew the Let's Encrypt certificate and reload nginx." \
+      "" "Usage:" "  ./renew-cert.sh" "" "Runs daily from /etc/cron.d/patogh-certbot."
+    exit 0
+    ;;
+  *)
+    printf '[x] Unknown option: %s (try --help).\n' "$1" >&2
+    exit 1
+    ;;
+esac
 
 CERTBOT_IMAGE="${CERTBOT_IMAGE:-certbot/certbot:v3.0.1}"
 
