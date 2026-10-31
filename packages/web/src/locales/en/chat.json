@@ -1,0 +1,225 @@
+{
+  "message": {
+    "edit": {
+      "hint": "escape to <cancel>cancel</cancel> • enter to <save>save</save>"
+    },
+    "edited": "(edited)",
+    "rowLabel": "{{author}}, {{time}}",
+    "gifAlt": "GIF",
+    "upload": {
+      "failed": "Upload failed",
+      "discard": "Discard"
+    },
+    "actions": {
+      "confirmDelete": "Confirm delete"
+    },
+    "reply": {
+      "jump": "Jump to the original message"
+    },
+    "mention": {
+      "unknownUser": "Unknown User",
+      "unknownRole": "Unknown Role"
+    },
+    "reactions": {
+      "you": "You",
+      "others_one": "{{count}} other",
+      "others_other": "{{count}} others",
+      "bySelf": "You reacted",
+      "byOne": "{{name}} reacted",
+      "byMany": "{{names}} reacted"
+    }
+  },
+  "list": {
+    "noHistoryPermission": "You do not have permission to view message history in this channel",
+    "loading": "Loading messages",
+    "loadingOlder": "Loading older messages",
+    "loadFailed": "Couldn't load messages",
+    "jumpToPresent": "Jump to Present",
+    "jump": {
+      "unavailable": "That message is no longer available",
+      "failed": "Couldn't load that message",
+      "presentFailed": "Couldn't load the latest messages"
+    },
+    "unread": {
+      "label": "New",
+      "divider": "New messages",
+      "dividerWithDate": "New messages, {{date}}"
+    },
+    "welcome": {
+      "channel": {
+        "title": "Welcome to the channel!",
+        "description": "This is the start of the conversation."
+      },
+      "group": {
+        "intro": "This is the beginning of your group conversation.",
+        "owner": "Owner: <owner>@{{name}}</owner>",
+        "federatedNotice": "Messages are stored on your and your recipients' home instances. They are not end-to-end encrypted.",
+        "openSettings": "Open Group Settings",
+        "leave": "Leave Group"
+      },
+      "dm": {
+        "fallbackName": "Direct Message",
+        "intro": "This is the beginning of your direct message history with <strong>@{{name}}</strong>.",
+        "federatedNotice": "Messages are stored on your and your recipient's home instances. They are not end-to-end encrypted.",
+        "removeFriend": "Remove Friend"
+      }
+    }
+  },
+  "composer": {
+    "noPermission": "You do not have permission to send messages in this channel",
+    "placeholder": {
+      "channel": "Message #{{name}}",
+      "dm": "Message @{{name}}"
+    },
+    "replyingTo": "Replying to",
+    "cancelReply": "Cancel reply",
+    "removeAttachment": "Remove attachment",
+    "attachFile": "Attach file",
+    "uploading": "Uploading…",
+    "uploadingLabel": "Uploading",
+    "failedCount_one": "{{count}} failed",
+    "failedCount_other": "{{count}} failed",
+    "failedHint": "Remove or retry the failed attachment to send",
+    "gif": "GIF",
+    "gifPicker": "GIF picker",
+    "emoji": "Emoji",
+    "emojiPicker": "Emoji picker",
+    "send": "Send",
+    "sendMessage": "Send message",
+    "uploadFailed": "Failed to upload {{file}}: {{reason}}",
+    "uploadFailedReason": "Upload failed",
+    "typing": {
+      "named_one": "{{names}} is typing",
+      "named_other": "{{names}} are typing",
+      "several": "Several people are typing"
+    }
+  },
+  "menu": {
+    "saveImage": "Save Image",
+    "copyImage": "Copy Image",
+    "openOriginal": "Open Original",
+    "saveVideo": "Save Video",
+    "saveAudio": "Save Audio",
+    "copyLink": "Copy Link",
+    "openLink": "Open Link",
+    "copySelectedText": "Copy Selected Text",
+    "copyText": "Copy Text",
+    "markUnread": "Mark Unread",
+    "editMessage": "Edit Message",
+    "deleteMessage": "Delete Message",
+    "linkCopied": "Copied link",
+    "linkCopyFailed": "Failed to copy link"
+  },
+  "attachment": {
+    "progress": {
+      "pausedTitle": "Paused — {{percent}}"
+    },
+    "video": {
+      "cannotPlayDownload": "Can't play here — download",
+      "unsupportedFormat": "Unsupported video format",
+      "unsupportedBrowser": "Your browser does not support video playback."
+    },
+    "audio": {
+      "unsupportedBrowser": "Your browser does not support audio playback."
+    },
+    "federation": {
+      "remoteNamed": "Hosted on {{sender}}'s instance. Download to keep a local copy.",
+      "remoteUnknown": "Hosted on the sender's instance. Download to keep a local copy.",
+      "partialGeneric": "Some recipients cannot cache this file locally.",
+      "partialInstance": "{{username}}'s instance (limit: {{limit}})",
+      "partialList": "File couldn't be cached on {{instances}}. They can still view it from yours.",
+      "listPair": "{{first}} and {{second}}"
+    }
+  },
+  "gif": {
+    "searchPlaceholder": "Search GIFs",
+    "noResults": "No GIFs found",
+    "noTrending": "No trending GIFs",
+    "attribution": "Powered by Klipy"
+  },
+  "preview": {
+    "save": "Save image",
+    "copy": "Copy image",
+    "alt": "Image preview"
+  },
+  "invite": {
+    "sentBy": "{{name}} sent an invite",
+    "memberCount_one": "{{count}} member",
+    "memberCount_other": "{{count}} members",
+    "revoked": "Invite no longer valid",
+    "join": "Join",
+    "joining": "Joining…",
+    "joinFailed": "Failed to join",
+    "askToJoin": "Ask to join",
+    "sendingRequest": "Sending…",
+    "requestSent": "Request sent",
+    "requestPending": "Request pending",
+    "requestNotice": "This space takes join requests. A manager approves each one.",
+    "requestReview": "A manager will review your request."
+  },
+  "notification": {
+    "unknownSender": "Someone",
+    "attachmentOnly": "Sent an attachment"
+  },
+  "embed": {
+    "loadAction": "Click to load",
+    "loadNamed": "Load {{name}}",
+    "loadUnnamed": "Load embed",
+    "frameTitle": "Embed",
+    "playNamed": "Play {{title}}",
+    "playUnnamed": "Play video",
+    "videoTitle": "Video"
+  },
+  "stickers": {
+    "title": "My stickers",
+    "upload": "Upload image",
+    "limits": "PNG, JPEG, WebP or GIF · up to 5 MB",
+    "loading": "Loading…",
+    "empty": "Your sticker collection starts here",
+    "remove": "Remove",
+    "save": "Add to my stickers",
+    "saved": "Added to my stickers",
+    "preview": "Preview sticker",
+    "manage": "Manage",
+    "done": "Done",
+    "collectionHint": "Pick a sticker to send. Make this space your own.",
+    "manageHint": "Rename or remove stickers in your collection. Messages already sent stay unchanged.",
+    "emptyHint": "Save your favorite moments as stickers, ready for your next reply.",
+    "chooseImage": "Choose image",
+    "cancel": "Cancel",
+    "replace": "Replace image",
+    "name": "Sticker name",
+    "dropImage": "Click or drop an image here",
+    "pasteHint": "You can also paste an image from your clipboard",
+    "uploading": "Adding sticker…",
+    "singleImage": "Choose one image at a time.",
+    "invalidSize": "Choose a non-empty image up to 5 MB.",
+    "invalidType": "Only PNG, JPEG, WebP and GIF images are supported.",
+    "invalidImage": "This image cannot be previewed. Choose a valid image.",
+    "removeNamed": "Remove {{name}}",
+    "addMore": "Add more",
+    "selectedCount_one": "{{count}} sticker selected",
+    "selectedCount_other": "{{count}} stickers selected",
+    "dropMore": "Click or drop more images here",
+    "sticker": "Sticker",
+    "downloadFailed": "The image could not be loaded.",
+    "batchLimit_one": "Choose up to {{count}} image at a time.",
+    "batchLimit_other": "Choose up to {{count}} images at a time.",
+    "capacityLimit_one": "Your collection has room for {{count}} more sticker.",
+    "capacityLimit_other": "Your collection has room for {{count}} more stickers.",
+    "full": "Your collection is full. Remove a sticker to add another.",
+    "batchFailed_one": "{{count}} image could not be added. It is still listed below.",
+    "batchFailed_other": "{{count}} images could not be added. They are still listed below.",
+    "uploadingProgress": "Adding {{current}} of {{total}}…",
+    "rename": "Rename",
+    "renameNamed": "Rename {{name}}",
+    "renameTitle": "Rename sticker",
+    "search": "Search stickers",
+    "noResults": "No stickers found"
+  },
+  "poke": {
+    "action": "Poke",
+    "received": "{{actor}} poked {{target}}",
+    "disconnected": "Disconnected. Poke was not sent."
+  }
+}
