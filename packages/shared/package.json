@@ -1,0 +1,36 @@
+{
+  "name": "@patogh/shared",
+  "version": "1.11.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "author": "Farzin Nasiri",
+  "type": "module",
+  "main": "./src/types.ts",
+  "types": "./src/types.ts",
+  "exports": {
+    ".": "./src/types.ts",
+    "./src/permissions": "./src/permissions.ts",
+    "./src/permissions.js": "./src/permissions.ts",
+    "./src/activities": "./src/activities.ts",
+    "./src/activities.js": "./src/activities.ts",
+    "./src/constants": "./src/constants.ts",
+    "./src/constants.js": "./src/constants.ts",
+    "./src/errors": "./src/errors.ts",
+    "./src/errors.js": "./src/errors.ts",
+    "./src/dmSystemEvents": "./src/dmSystemEvents.ts",
+    "./src/dmSystemEvents.js": "./src/dmSystemEvents.ts",
+    "./src/stickers": "./src/stickers.ts",
+    "./src/stickers.js": "./src/stickers.ts",
+    "./src/channelSystemEvents": "./src/channelSystemEvents.ts",
+    "./src/channelSystemEvents.js": "./src/channelSystemEvents.ts",
+    "./src/mentions": "./src/mentions.ts",
+    "./src/mentions.js": "./src/mentions.ts"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}
