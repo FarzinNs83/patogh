@@ -1,0 +1,222 @@
+import { OwnerTitleHeading } from './OwnerTitleHeading';
+import { useMemberContextMenu } from './memberMenu/useMemberContextMenu';
+import { useContextMenuStore } from '../../stores/contextMenuStore';
+import React, { useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
+import type { MemberWithUser, Activity } from '@patogh/shared';
+import { useFormatters } from '../../i18n/formatters';
+import { useSpaceStore } from '../../stores/spaceStore';
+import { useUIStore } from '../../stores/uiStore';
+import { useActivityStore, activitiesFor } from '../../stores/activityStore';
+import { Avatar } from '../ui/Avatar';
+import { ActivityCard, hasRichActivity, getActivityAccentClass } from '../ui/ActivityCard';
+import { getPrimaryActivity } from '@patogh/shared/src/activities.js';
+import { parseFederatedUsername, isFederationGlobeApplicable, spaceMemberName } from '../../utils/identity';
+import { useSpaceOrigin } from '../../hooks/useSpaceOrigin';
+import { useCanonicalUserView } from '../../utils/userViewLookup';
+import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { groupMembers, memberNameColor, type MemberGroupKind } from '../../utils/memberGroups';
+
+/** Keyboard focus ring for a member row (the rows are focusable controls). */
+const ROW_FOCUS_CLASS = 'outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-primary/60';
+
+function MemberSidebarRow({
+  member,
+  isOffline,
+  colorStyle,
+  activities,
+  isRichActivity,
+  accentClass,
+  onClickMember,
+  onContextMenuMember,
+}: {
+  member: MemberWithUser;
+  isOffline: boolean;
+  colorStyle: React.CSSProperties | undefined;
+  activities: Activity[];
+  isRichActivity: boolean;
+  accentClass: string;
+  onClickMember: (e: React.MouseEvent | React.KeyboardEvent, member: MemberWithUser, user: MemberWithUser['user']) => void;
+  onContextMenuMember: (e: React.MouseEvent | React.KeyboardEvent, member: MemberWithUser, user: MemberWithUser['user']) => void;
+}) {
+  const origin = useSpaceOrigin(member.spaceId);
+  const canonical = useCanonicalUserView(member.user, origin);
+  const displayName = spaceMemberName(member, canonical);
+
+  const rowClass = isRichActivity
+    ? `flex items-center gap-2.5 px-2.5 py-2 rounded-[10px] mb-1 cursor-pointer transition-colors glass-pill border-l-2 ${accentClass} ${ROW_FOCUS_CLASS}`
+    : `flex items-center gap-2.5 px-2 py-1.5 rounded-[4px] hover:bg-interactive-hover cursor-pointer group transition-colors ${ROW_FOCUS_CLASS}`;
+
+  // The row is a control: Enter and Space open the profile like a click, and
+  // the menu key or Shift+F10 open the member menu like a right click.
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.target !== e.currentTarget) return;
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      onClickMember(e, member, canonical);
+    } else if (e.key === 'ContextMenu' || (e.key === 'F10' && e.shiftKey)) {
+      e.preventDefault();
+      onContextMenuMember(e, member, canonical);
+    }
+  };
+
+  return (
+    <div
+      key={member.userId}
+      onClick={(e) => onClickMember(e, member, canonical)}
+      onContextMenu={(e) => onContextMenuMember(e, member, canonical)}
+      onKeyDown={handleKeyDown}
+      role="button"
+      tabIndex={0}
+      aria-haspopup="menu"
+      data-context-menu
+      className={rowClass}
+    >
+      <Avatar
+        src={canonical.avatar}
+        name={displayName}
+        size={32}
+        status={isOffline ? 'offline' : canonical.status}
+        className={isOffline ? 'opacity-60' : undefined}
+        user={canonical}
+      />
+      <div className="flex-1 min-w-0">
+        <span
+          className={`text-[13.5px] leading-[1.2] font-medium truncate ${colorStyle ? (isOffline ? 'opacity-60' : '') : (isOffline ? 'text-txt-tertiary' : 'text-txt-primary')}`}
+          style={colorStyle}
+        >
+          {displayName}
+        </span>
+        {!isOffline && isFederationGlobeApplicable(canonical) && (
+          <div className="text-[10px] leading-[1.3] text-txt-tertiary truncate opacity-60">@{parseFederatedUsername(canonical.username).domain}</div>
+        )}
+        {!isOffline && (
+          <ActivityCard
+            activities={activities}
+            fallbackCustomStatus={canonical.customStatus}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+export function MemberSidebar() {
+  const { t } = useTranslation(['spaces', 'common']);
+  const { formatNumber } = useFormatters();
+  const members = useSpaceStore((s) => s.members);
+  const spaces = useSpaceStore((s) => s.spaces);
+  const currentSpaceId = useSpaceStore((s) => s.currentSpaceId);
+  const loadingSpaceId = useSpaceStore((s) => s.loadingSpaceId);
+  const memberListOpen = useUIStore((s) => s.memberListOpen);
+  const openUserProfile = useUIStore((s) => s.openUserProfile);
+  const userActivities = useActivityStore((s) => s.userActivities);
+
+  const space = spaces.find(s => s.id === currentSpaceId);
+  const ownerId = space?.ownerId;
+  const memberMenu = useMemberContextMenu(space);
+  const spaceOrigin = space?._instanceOrigin ?? '';
+
+  const { groups: roleGroups, offline: offlineMembers } = useMemo(() => groupMembers(members, ownerId), [members, ownerId]);
+
+  const isLoadingSpace = !!loadingSpaceId && loadingSpaceId === currentSpaceId;
+  const showMemberSkeleton = useDelayedLoading(isLoadingSpace);
+
+  if (!memberListOpen) return null;
+
+  const getMemberColor = (member: MemberWithUser): React.CSSProperties | undefined => {
+    const color = memberNameColor(member, ownerId);
+    return color ? { color } : undefined;
+  };
+
+  const handleMemberClick = (e: React.MouseEvent | React.KeyboardEvent, member: MemberWithUser, user: MemberWithUser['user']) => {
+    e.stopPropagation();
+    // Left-click remains profile-only, even for moderators.
+    useContextMenuStore.getState().close();
+    const origin = useSpaceStore.getState().spaces.find(s => s.id === member.spaceId)?._instanceOrigin ?? '';
+    openUserProfile(user, origin, e.currentTarget.getBoundingClientRect(), 'left', { spaceId: member.spaceId, userId: member.userId });
+  };
+
+  const groupHeading = (kind: MemberGroupKind, label: string | null): string => {
+    if (kind === 'owner') return t('spaces:members.groups.owner');
+    if (kind === 'online') return t('common:states.online');
+    return label ?? '';
+  };
+
+  const renderMember = (member: MemberWithUser, isOffline = false) => {
+    // Roles do not depend on presence: an offline member keeps their colour,
+    // dimmed with the rest of the row.
+    const colorStyle = getMemberColor(member);
+    const activities = activitiesFor(userActivities, member.user, spaceOrigin);
+    const isRichActivity = !isOffline && hasRichActivity(activities);
+    const primary = getPrimaryActivity(activities);
+    const accentClass = primary ? getActivityAccentClass(primary.type) : '';
+    return (
+      <MemberSidebarRow
+        key={member.userId}
+        member={member}
+        isOffline={isOffline}
+        colorStyle={colorStyle}
+        activities={activities}
+        isRichActivity={isRichActivity}
+        accentClass={accentClass}
+        onClickMember={handleMemberClick}
+        onContextMenuMember={memberMenu.open}
+      />
+    );
+  };
+
+  return (
+    <>
+    {memberMenu.dialogs}
+    <div className="w-60 bg-surface-members flex-shrink-0 overflow-y-auto select-none no-scrollbar hidden desktop:block border-l border-border-hard">
+      {showMemberSkeleton ? (
+        <div className="px-3 pt-4" role="status" aria-label={t('spaces:members.loading')}>
+          {/* Role group 1 */}
+          <div className="skeleton skeleton-bar h-2 w-[40%] mb-3" style={{ animationDelay: '0s' }} />
+          {Array.from({ length: 2 }, (_, i) => (
+            <div key={i} className="flex items-center gap-3 py-1.5 mb-1" style={{ animationDelay: `${i * 0.12}s` }}>
+              <div className="skeleton skeleton-circle w-8 h-8 flex-shrink-0" style={{ animationDelay: `${i * 0.12}s` }} />
+              <div className="skeleton skeleton-bar" style={{ width: `${45 + (i * 19) % 30}%`, animationDelay: `${i * 0.12}s` }} />
+            </div>
+          ))}
+          {/* Role group 2 */}
+          <div className="skeleton skeleton-bar h-2 w-[50%] mb-3 mt-5" style={{ animationDelay: '0.25s' }} />
+          {Array.from({ length: 5 }, (_, i) => (
+            <div key={i} className="flex items-center gap-3 py-1.5 mb-1" style={{ animationDelay: `${(i + 2) * 0.12}s` }}>
+              <div className="skeleton skeleton-circle w-8 h-8 flex-shrink-0" style={{ animationDelay: `${(i + 2) * 0.12}s` }} />
+              <div className="skeleton skeleton-bar" style={{ width: `${40 + (i * 15) % 35}%`, animationDelay: `${(i + 2) * 0.12}s` }} />
+            </div>
+          ))}
+        </div>
+      ) : (
+      <div className="p-3">
+        {/* Role-based groups */}
+        {roleGroups.map((group) => (
+          <div key={group.key} className="mb-4">
+            {group.kind === 'owner' && space ? (
+              <OwnerTitleHeading key={space.id} space={space} count={group.members.length} />
+            ) : (
+              <h3 className="text-[10.5px] font-bold text-txt-tertiary uppercase tracking-[0.06em] px-2 mb-1">
+                {groupHeading(group.kind, group.label)} — {formatNumber(group.members.length)}
+              </h3>
+            )}
+            {group.members.map((m) => renderMember(m))}
+          </div>
+        ))}
+
+        {/* Offline */}
+        {offlineMembers.length > 0 && (
+          <div>
+            <h3 className="text-[10.5px] font-bold text-txt-tertiary uppercase tracking-[0.06em] px-2 mb-1">
+              {t('common:states.offline')} — {formatNumber(offlineMembers.length)}
+            </h3>
+            {offlineMembers.map((m) => renderMember(m, true))}
+          </div>
+        )}
+      </div>
+      )}
+    </div>
+    </>
+  );
+}

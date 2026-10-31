@@ -1,0 +1,279 @@
+import React, { useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import type { User } from '@patogh/shared';
+import { useChatStore } from '../../stores/chatStore';
+import { useSpaceStore } from '../../stores/spaceStore';
+import { useUIStore } from '../../stores/uiStore';
+import { useSocialStore } from '../../stores/socialStore';
+import { isMine, parseFederatedUsername, userKey } from '../../utils/identity';
+import { useDmViewer } from '../../hooks/useDmViewer';
+import { kickFromGroupDm, transferGroupDmOwnership } from '../../utils/groupDmOwnerActions';
+import { ConfirmDialog } from '../ui/ConfirmDialog';
+import { DmMemberRow, type DmMemberRowAction } from './DmMemberRow';
+import { visualPixels } from '../../platform/interfaceScale';
+import { pointAnchor } from '../../hooks/useFloatingPosition';
+
+/**
+ * Right-side roster for group DMs. Mirrors `MemberSidebar`'s layout language
+ * (240px column, structural surface, hidden on mobile) so toggling
+ * `memberListOpen` feels identical across spaces and group DMs.
+ *
+ * Renders nothing for 1-on-1 DMs and when `memberListOpen` is false. The
+ * default-state inheritance is intentional — this panel does not own a
+ * separate boolean and explicitly carries the user's global toggle preference.
+ */
+export function DmRosterPanel() {
+  const { t } = useTranslation(['dm', 'common']);
+  const memberListOpen = useUIStore((s) => s.memberListOpen);
+  const openUserProfile = useUIStore((s) => s.openUserProfile);
+  const addToast = useUIStore((s) => s.addToast);
+
+  const currentChannelId = useChatStore((s) => s.currentChannelId);
+  const dmChannels = useSpaceStore((s) => s.dmChannels);
+  const currentSpaceId = useSpaceStore((s) => s.currentSpaceId);
+  const showDms = useUIStore((s) => s.showDms);
+
+  const friends = useSocialStore((s) => s.friends);
+  const removeFriendStore = useSocialStore((s) => s.removeFriend);
+
+  const dmChannel = useMemo(
+    () => dmChannels.find((dm) => dm.id === currentChannelId) ?? null,
+    [dmChannels, currentChannelId],
+  );
+  const viewer = useDmViewer(dmChannel?.id);
+
+  // Confirm-state for destructive actions. Two separate slots — kick + transfer
+  // — so we can keep simple state without a discriminated union.
+  const [pendingKick, setPendingKick] = useState<User | null>(null);
+  const [pendingTransfer, setPendingTransfer] = useState<User | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  // ── Visibility gates ────────────────────────────────────────────────────
+  // Render only when:
+  //   1. We're in the DM view (showDms=true OR no current space).
+  //   2. The current channel is a group DM (ownerId set).
+  //   3. The global member-list toggle is on.
+  const inDmView = showDms || !currentSpaceId;
+  const isGroupDm = !!dmChannel?.ownerId;
+
+  if (!inDmView || !dmChannel || !isGroupDm || !memberListOpen) {
+    return null;
+  }
+
+  const ownerId = dmChannel.ownerId;
+  const callerIsOwner = !!ownerId && isMine({ id: ownerId }, viewer.origin, viewer.self);
+
+  // ── Section grouping ────────────────────────────────────────────────────
+  // Owner first (always exactly one row), then online and offline groups
+  // sorted alphabetically by displayName (falling back to baseName from the
+  // username). This mirrors MemberSidebar's offline-section ordering and
+  // its display-name-first label resolution.
+  const sortByDisplayName = (a: User, b: User) => {
+    const aName = (a.displayName ?? parseFederatedUsername(a.username).baseName).toLowerCase();
+    const bName = (b.displayName ?? parseFederatedUsername(b.username).baseName).toLowerCase();
+    return aName.localeCompare(bName);
+  };
+
+  const ownerMember = dmChannel.members.find((m) => m.id === ownerId) ?? null;
+  const nonOwnerMembers = dmChannel.members.filter((m) => m.id !== ownerId);
+  const onlineMembers = nonOwnerMembers
+    .filter((m) => m.status !== 'offline')
+    .sort(sortByDisplayName);
+  const offlineMembers = nonOwnerMembers
+    .filter((m) => m.status === 'offline')
+    .sort(sortByDisplayName);
+
+  // ── Per-row helpers ────────────────────────────────────────────────────
+  const isFriendOfCaller = (m: User): boolean => {
+    // The same person, whichever instance's row each list holds (`userKey`).
+    const key = userKey(m, viewer.origin);
+    return friends.some((f) => userKey(f, f._instanceOrigin) === key);
+  };
+
+  const handleMenuAction = async (action: DmMemberRowAction, member: User) => {
+    if (action === 'profile') {
+      // Profile popout is anchored by DmMemberRow itself (matches the
+      // MemberSidebar pattern). This branch only fires on the unlikely
+      // fallback path where the row couldn't compute its bounding rect —
+      // in that case, anchor to the top-left of the roster column.
+      openUserProfile(member, viewer.origin, pointAnchor(visualPixels(100), visualPixels(100)));
+      return;
+    }
+    if (action === 'kick') {
+      setPendingKick(member);
+      return;
+    }
+    if (action === 'transfer') {
+      setPendingTransfer(member);
+      return;
+    }
+    if (action === 'remove-friend') {
+      try {
+        await removeFriendStore(member, viewer.origin);
+      } catch (err) {
+        addToast(
+          err instanceof Error ? err.message : t('dm:removeFriend.failed'),
+          'warning',
+          3000,
+        );
+      }
+    }
+  };
+
+  const confirmKick = async () => {
+    if (!pendingKick) return;
+    setSubmitting(true);
+    try {
+      // Sent to the owner's instance, naming the conversation and the
+      // member as its copy does (`groupDmOwnerActions`).
+      await kickFromGroupDm(dmChannel.id, pendingKick);
+      addToast(
+        t('dm:kick.success', { name: pendingKick.displayName ?? parseFederatedUsername(pendingKick.username).baseName }),
+        'success',
+        3000,
+      );
+      setPendingKick(null);
+    } catch (err) {
+      addToast(
+        err instanceof Error ? err.message : t('dm:kick.failed'),
+        'warning',
+        3000,
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const confirmTransfer = async () => {
+    if (!pendingTransfer) return;
+    setSubmitting(true);
+    try {
+      await transferGroupDmOwnership(dmChannel.id, pendingTransfer);
+      addToast(
+        t('dm:transfer.success', { name: pendingTransfer.displayName ?? parseFederatedUsername(pendingTransfer.username).baseName }),
+        'success',
+        3000,
+      );
+      setPendingTransfer(null);
+    } catch (err) {
+      addToast(
+        err instanceof Error ? err.message : t('dm:transfer.failed'),
+        'warning',
+        3000,
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const totalCount = dmChannel.members.length;
+
+  // ── Render ─────────────────────────────────────────────────────────────
+  // Width / surface mirror `MemberSidebar` so toggling visually swaps a
+  // like-shaped column.
+  return (
+    <div
+      data-dm-roster-panel
+      className="w-60 bg-surface-members flex-shrink-0 overflow-y-auto select-none no-scrollbar hidden desktop:block border-l border-border-hard"
+    >
+      <div className="p-3">
+        <h3
+          data-dm-roster-header
+          className="text-[10.5px] font-bold text-txt-tertiary uppercase tracking-[0.06em] px-2 mb-2"
+        >
+          {t('dm:roster.sectionCount', { label: t('common:labels.members'), total: totalCount })}
+        </h3>
+
+        {ownerMember && (
+          <div data-dm-roster-section="owner" className="mb-4">
+            <h4 className="text-[10.5px] font-bold text-txt-tertiary uppercase tracking-[0.06em] px-2 mb-1">
+              {t('dm:roster.owner')}
+            </h4>
+            <DmMemberRow
+              member={ownerMember}
+              isOwner
+              isSelf={isMine(ownerMember, viewer.origin, viewer.self)}
+              origin={viewer.origin}
+              callerIsOwner={callerIsOwner}
+              isFriend={isFriendOfCaller(ownerMember)}
+              showKebab
+              onMenuAction={handleMenuAction}
+            />
+          </div>
+        )}
+
+        {onlineMembers.length > 0 && (
+          <div data-dm-roster-section="online" className="mb-4">
+            <h4 className="text-[10.5px] font-bold text-txt-tertiary uppercase tracking-[0.06em] px-2 mb-1">
+              {t('dm:roster.sectionCount', { label: t('common:states.online'), total: onlineMembers.length })}
+            </h4>
+            {onlineMembers.map((m) => (
+              <DmMemberRow
+                key={m.id}
+                member={m}
+                isOwner={false}
+                isSelf={isMine(m, viewer.origin, viewer.self)}
+                origin={viewer.origin}
+                callerIsOwner={callerIsOwner}
+                isFriend={isFriendOfCaller(m)}
+                showKebab
+                onMenuAction={handleMenuAction}
+              />
+            ))}
+          </div>
+        )}
+
+        {offlineMembers.length > 0 && (
+          <div data-dm-roster-section="offline" className="opacity-60">
+            <h4 className="text-[10.5px] font-bold text-txt-tertiary uppercase tracking-[0.06em] px-2 mb-1">
+              {t('dm:roster.sectionCount', { label: t('common:states.offline'), total: offlineMembers.length })}
+            </h4>
+            {offlineMembers.map((m) => (
+              <DmMemberRow
+                key={m.id}
+                member={m}
+                isOwner={false}
+                isSelf={isMine(m, viewer.origin, viewer.self)}
+                origin={viewer.origin}
+                callerIsOwner={callerIsOwner}
+                isFriend={isFriendOfCaller(m)}
+                showKebab
+                onMenuAction={handleMenuAction}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+
+      <ConfirmDialog
+        isOpen={!!pendingKick}
+        onClose={() => { if (!submitting) setPendingKick(null); }}
+        onConfirm={confirmKick}
+        title={t('dm:kick.title')}
+        description={
+          pendingKick
+            ? t('dm:kick.description', { name: pendingKick.displayName ?? parseFederatedUsername(pendingKick.username).baseName })
+            : ''
+        }
+        confirmLabel={t('common:actions.remove')}
+        variant="danger"
+        loading={submitting}
+      />
+
+      <ConfirmDialog
+        isOpen={!!pendingTransfer}
+        onClose={() => { if (!submitting) setPendingTransfer(null); }}
+        onConfirm={confirmTransfer}
+        title={t('dm:transfer.title')}
+        description={
+          pendingTransfer
+            ? t('dm:transfer.description', { name: pendingTransfer.displayName ?? parseFederatedUsername(pendingTransfer.username).baseName })
+            : ''
+        }
+        confirmLabel={t('dm:transfer.confirm')}
+        variant="warning"
+        loading={submitting}
+      />
+    </div>
+  );
+}

@@ -1,0 +1,303 @@
+import { act, cleanup, render } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { DmChannel, MessageWithUser, NotificationSetting, User, UserStatus } from '@patogh/shared';
+
+const playSound = vi.hoisted(() => vi.fn());
+vi.mock('../../audio/AudioManager', () => ({
+  AudioManager: { getInstance: () => ({ playSound }) },
+}));
+
+import { SoundController } from './SoundController';
+import { useAuthStore } from '../../stores/authStore';
+import { useChatStore } from '../../stores/chatStore';
+import { useSpaceStore } from '../../stores/spaceStore';
+import { useVoiceStore } from '../../stores/voiceStore';
+import { notificationSettingKey, useNotificationSettingsStore } from '../../stores/notificationSettingsStore';
+
+function loopSource() {
+  return { stop: vi.fn() } as unknown as AudioBufferSourceNode;
+}
+
+function incoming(id: string, channelId = 'dm') {
+  return {
+    channelId,
+    message: { id, channelId, userId: 'other', content: 'Hello' } as MessageWithUser,
+  };
+}
+
+function soundsPlayed(): string[] {
+  return playSound.mock.calls.map(([name]) => name as string);
+}
+
+function mountAs(status: UserStatus) {
+  useAuthStore.setState({ user: { id: 'me', status } as User });
+  const view = render(<SoundController />);
+  act(() => vi.advanceTimersByTime(1000));
+  return view;
+}
+
+beforeEach(() => {
+  vi.useFakeTimers();
+  playSound.mockReset();
+  playSound.mockImplementation(() => Promise.resolve(loopSource()));
+  useSpaceStore.setState({ dmChannels: [{ id: 'dm' } as DmChannel] });
+  useChatStore.setState({ realtimeMessageEvents: [] });
+  useVoiceStore.setState({
+    incomingCall: null,
+    outgoingCall: null,
+    isCameraOn: false,
+    messageSoundAllChannels: false,
+  });
+});
+
+afterEach(() => {
+  cleanup();
+  useAuthStore.setState({ myRowIds: new Map() });
+  vi.useRealTimers();
+});
+
+describe('SoundController message sound', () => {
+  it('plays for a DM while online', () => {
+    mountAs('online');
+    act(() => useChatStore.setState({ realtimeMessageEvents: [incoming('m1')] }));
+    expect(soundsPlayed()).toEqual(['message']);
+  });
+
+  it('stays silent for a DM while on dnd', () => {
+    mountAs('dnd');
+    act(() => useChatStore.setState({ realtimeMessageEvents: [incoming('m1')] }));
+    expect(soundsPlayed()).toEqual([]);
+  });
+
+  it('keeps playing once the 50-event buffer is full', () => {
+    const full = Array.from({ length: 50 }, (_, i) => incoming(`old-${i}`));
+    useChatStore.setState({ realtimeMessageEvents: full });
+    mountAs('online');
+    act(() => useChatStore.setState({ realtimeMessageEvents: [...full.slice(1), incoming('new')] }));
+    expect(soundsPlayed()).toEqual(['message']);
+  });
+});
+
+describe('SoundController message sound on a remote instance\'s channels', () => {
+  function event(id: string, channelId: string, content: string, userId = 'other') {
+    return { channelId, message: { id, channelId, userId, content } as MessageWithUser };
+  }
+
+  beforeEach(() => {
+    useSpaceStore.setState({
+      dmChannels: [{ id: 'dm' } as DmChannel, { id: 'remote-dm' } as DmChannel],
+      channelOriginMap: new Map([['remote-chat', 'https://remote.example'], ['remote-dm', 'https://remote.example']]),
+    });
+    useAuthStore.getState().recordMyRow('https://remote.example', 'remote-me');
+  });
+
+  it('plays for a mention by the id the user has on that instance', () => {
+    mountAs('online');
+    act(() => useChatStore.setState({ realtimeMessageEvents: [event('m1', 'remote-chat', 'Look <@remote-me>')] }));
+    expect(soundsPlayed()).toEqual(['message']);
+  });
+
+  it('stays silent for the user\'s own message in a remote DM', () => {
+    mountAs('online');
+    act(() => useChatStore.setState({ realtimeMessageEvents: [event('m1', 'remote-dm', 'Hi', 'remote-me')] }));
+    expect(soundsPlayed()).toEqual([]);
+  });
+
+  it('plays for every other message when the every-message preference is on, but not for the user\'s own', () => {
+    useVoiceStore.setState({ messageSoundAllChannels: true });
+    mountAs('online');
+    act(() => useChatStore.setState({ realtimeMessageEvents: [event('m1', 'remote-chat', 'Hi', 'remote-me')] }));
+    expect(soundsPlayed()).toEqual([]);
+    act(() => useChatStore.setState({ realtimeMessageEvents: [
+      event('m1', 'remote-chat', 'Hi', 'remote-me'),
+      event('m2', 'remote-chat', 'Hello everyone'),
+    ] }));
+    expect(soundsPlayed()).toEqual(['message']);
+  });
+});
+
+describe('SoundController message sound follows notification settings (#394)', () => {
+  const REMOTE = 'https://remote.example';
+  function event(id: string, channelId: string, content: string) {
+    return { channelId, message: { id, channelId, userId: 'other', content } as MessageWithUser };
+  }
+  function seed(setting: Partial<NotificationSetting>) {
+    const full: NotificationSetting = { spaceId: 'remote-space', channelId: null, level: null, muted: false, mutedUntil: null, updatedAt: 1, ...setting };
+    useNotificationSettingsStore.setState({
+      settings: new Map([[notificationSettingKey(REMOTE, { spaceId: full.spaceId, channelId: full.channelId }), full]]),
+    });
+  }
+
+  beforeEach(() => {
+    useSpaceStore.setState({
+      channelToSpaceMap: new Map([['remote-chat', 'remote-space']]),
+      channelOriginMap: new Map([['remote-chat', REMOTE]]),
+    });
+    useAuthStore.getState().recordMyRow(REMOTE, 'remote-me');
+  });
+
+  afterEach(() => {
+    useNotificationSettingsStore.getState().reset();
+  });
+
+  it('plays for a plain message in a channel set to all', () => {
+    seed({ channelId: 'remote-chat', level: 'all' });
+    mountAs('online');
+    act(() => useChatStore.setState({ realtimeMessageEvents: [event('m1', 'remote-chat', 'Hello everyone')] }));
+    expect(soundsPlayed()).toEqual(['message']);
+  });
+
+  it('stays silent for a mention while the space is muted', () => {
+    seed({ muted: true });
+    mountAs('online');
+    act(() => useChatStore.setState({ realtimeMessageEvents: [event('m1', 'remote-chat', 'Look <@remote-me>')] }));
+    expect(soundsPlayed()).toEqual([]);
+  });
+
+  it('keeps a channel set to nothing silent although the every-message preference is on', () => {
+    useVoiceStore.setState({ messageSoundAllChannels: true });
+    seed({ channelId: 'remote-chat', level: 'nothing' });
+    mountAs('online');
+    act(() => useChatStore.setState({ realtimeMessageEvents: [event('m1', 'remote-chat', 'Look <@remote-me>')] }));
+    expect(soundsPlayed()).toEqual([]);
+  });
+});
+
+describe('SoundController incoming call ringing', () => {
+  it('rings while online', async () => {
+    mountAs('online');
+    await act(async () => {
+      useVoiceStore.setState({ incomingCall: { dmChannelId: 'dm', callerId: 'other', callerName: 'Other' } });
+    });
+    expect(soundsPlayed()).toEqual(['call_ringing']);
+    act(() => useVoiceStore.setState({ incomingCall: null }));
+  });
+
+  it('does not ring while on dnd', async () => {
+    mountAs('dnd');
+    await act(async () => {
+      useVoiceStore.setState({ incomingCall: { dmChannelId: 'dm', callerId: 'other', callerName: 'Other' } });
+    });
+    expect(soundsPlayed()).toEqual([]);
+    act(() => useVoiceStore.setState({ incomingCall: null }));
+  });
+});
+
+describe('SoundController ringing follows the status while a call rings', () => {
+  const call = { dmChannelId: 'dm', callerId: 'other', callerName: 'Other' };
+
+  it('stops the ring when the user switches to dnd mid-ring', async () => {
+    const source = loopSource();
+    playSound.mockImplementation(() => Promise.resolve(source));
+    mountAs('online');
+    await act(async () => { useVoiceStore.setState({ incomingCall: call }); });
+    expect(soundsPlayed()).toEqual(['call_ringing']);
+
+    await act(async () => { useAuthStore.setState({ user: { id: 'me', status: 'dnd' } as User }); });
+    expect(source.stop).toHaveBeenCalledOnce();
+    act(() => useVoiceStore.setState({ incomingCall: null }));
+  });
+
+  it('starts the ring when the user leaves dnd while the call is still ringing', async () => {
+    mountAs('dnd');
+    await act(async () => { useVoiceStore.setState({ incomingCall: call }); });
+    expect(soundsPlayed()).toEqual([]);
+
+    await act(async () => { useAuthStore.setState({ user: { id: 'me', status: 'online' } as User }); });
+    expect(soundsPlayed()).toEqual(['call_ringing']);
+    act(() => useVoiceStore.setState({ incomingCall: null }));
+  });
+
+  it('does not start a second loop when an unrelated user field changes', async () => {
+    mountAs('online');
+    await act(async () => { useVoiceStore.setState({ incomingCall: call }); });
+    await act(async () => { useAuthStore.setState({ user: { id: 'me', status: 'online', bio: 'x' } as User }); });
+    expect(soundsPlayed()).toEqual(['call_ringing']);
+    act(() => useVoiceStore.setState({ incomingCall: null }));
+  });
+});
+
+describe('SoundController ringing when a cue never loads', () => {
+  const call = { dmChannelId: 'dm', callerId: 'other', callerName: 'Other' };
+
+  it('rings for the next call after a playSound that never settled', async () => {
+    let settleFirst: (source: AudioBufferSourceNode | null) => void = () => {};
+    const first = loopSource();
+    playSound.mockImplementationOnce(() => new Promise((resolve) => { settleFirst = resolve; }));
+    mountAs('online');
+
+    await act(async () => { useVoiceStore.setState({ incomingCall: call }); });
+    await act(async () => { useVoiceStore.setState({ incomingCall: null }); });
+    await act(async () => { useVoiceStore.setState({ incomingCall: { ...call } }); });
+    expect(soundsPlayed()).toEqual(['call_ringing', 'call_ringing']);
+
+    // The abandoned load finally lands: it must not become a second loop.
+    await act(async () => { settleFirst(first); });
+    expect(first.stop).toHaveBeenCalledOnce();
+    act(() => useVoiceStore.setState({ incomingCall: null }));
+  });
+});
+
+describe('SoundController own-action cues', () => {
+  it('still plays the camera cue on dnd: it is feedback, not a notification', () => {
+    mountAs('dnd');
+    act(() => useVoiceStore.setState({ isCameraOn: true }));
+    expect(soundsPlayed()).toEqual(['camera_on']);
+  });
+});
+
+describe('SoundController across a LiveKit reconnect', () => {
+  const participant = (userId: string, isLocal = false) => ({ userId, identity: `${userId}:${userId}`, isLocal, isScreenSharing: false });
+
+  function inRoom(): void {
+    useVoiceStore.setState({
+      isLiveKitConnected: true,
+      voiceConnectionStatus: 'connected',
+      participants: [participant('me', true), participant('bob')] as never,
+    });
+  }
+
+  beforeEach(() => {
+    useVoiceStore.setState({
+      isLiveKitConnected: false,
+      voiceConnectionStatus: 'disconnected',
+      participants: [],
+      currentVoiceChannelId: 'voice-1',
+      activeDmCall: null,
+    });
+  });
+
+  it('plays nothing for a reconnect the user never left through', () => {
+    mountAs('online');
+    act(() => inRoom());
+    playSound.mockClear();
+
+    // LiveKit reconnects fully: the room drops every remote participant until it is back.
+    act(() => useVoiceStore.setState({ isLiveKitConnected: false, voiceConnectionStatus: 'reconnecting', participants: [participant('me', true)] as never }));
+    act(() => inRoom());
+
+    expect(soundsPlayed()).toEqual([]);
+  });
+
+  it('plays the leave of someone who really left while it reconnected', () => {
+    mountAs('online');
+    act(() => inRoom());
+    playSound.mockClear();
+
+    act(() => useVoiceStore.setState({ isLiveKitConnected: false, voiceConnectionStatus: 'reconnecting', participants: [participant('me', true)] as never }));
+    act(() => useVoiceStore.setState({ isLiveKitConnected: true, voiceConnectionStatus: 'connected', participants: [participant('me', true)] as never }));
+
+    expect(soundsPlayed()).toEqual(['user_leave']);
+  });
+
+  it('plays the disconnect once a reconnect gives up', () => {
+    mountAs('online');
+    act(() => inRoom());
+    playSound.mockClear();
+
+    act(() => useVoiceStore.setState({ isLiveKitConnected: false, voiceConnectionStatus: 'reconnecting' }));
+    act(() => useVoiceStore.setState({ participants: [], voiceConnectionStatus: 'disconnected' }));
+
+    expect(soundsPlayed()).toEqual(['disconnect']);
+  });
+});

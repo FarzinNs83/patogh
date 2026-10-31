@@ -1,0 +1,188 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import type { Channel, ChannelCategory, Role } from '@patogh/shared';
+
+// Reached transitively via spaceStore -> chatStore -> useWebSocket -> voiceStore.
+vi.mock('../../audio/AudioManager', () => ({
+  AudioManager: {
+    getInstance: vi.fn().mockReturnValue({ setOutputDevice: vi.fn(), setVolume: vi.fn() }),
+  },
+}));
+
+interface Row { targetType: string; targetId: string; allow: string; deny: string }
+
+// The override routes of both entities, answered from one in-memory table
+// that checks the edit version as the server does (#365).
+let rows: Row[] = [];
+function stale(targetType: string, targetId: string, version: string | undefined): boolean {
+  const current = rows.find((r) => r.targetType === targetType && r.targetId === targetId);
+  return version !== undefined && overrideVersion(current) !== version;
+}
+const conflict = () => new HttpError(409, 'Conflict', undefined, 'overrides_conflict');
+const put = vi.fn(async (_id: string, data: Row & { version?: string }) => {
+  if (stale(data.targetType, data.targetId, data.version)) throw conflict();
+  const stored: Row = { targetType: data.targetType, targetId: data.targetId, allow: data.allow, deny: data.deny };
+  rows = [...rows.filter((r) => !(r.targetType === data.targetType && r.targetId === data.targetId)), stored];
+  return { success: true };
+});
+const remove = vi.fn(async (_id: string, targetType: string, targetId: string, version?: string) => {
+  if (stale(targetType, targetId, version)) throw conflict();
+  rows = rows.filter((r) => !(r.targetType === targetType && r.targetId === targetId));
+  return { success: true };
+});
+const get = vi.fn(async () => rows.map((r) => ({ ...r })));
+const routes = { getOverrides: get, putOverride: put, deleteOverride: remove };
+
+vi.mock('../../utils/crossStoreResolvers', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../utils/crossStoreResolvers')>()),
+  getApiForOrigin: () => ({ channels: routes, categories: routes }),
+}));
+
+import { ChannelSettingsModal } from './ChannelSettingsModal';
+import { CategorySettingsModal } from './CategorySettingsModal';
+import { useSpaceStore, type TaggedSpace } from '../../stores/spaceStore';
+import { useUIStore } from '../../stores/uiStore';
+import { HttpError } from '../../api/client';
+import { ALL_PERMISSIONS, PermissionBits, permissionsToString, stringToPermissions, overrideVersion } from '../../utils/permissions';
+
+// #327 and #365: privacy is @everyone's View Channels deny, one bit of one
+// override. Switching it touches that bit only, and the Overview reads the
+// same overrides the Permissions tab edits.
+
+const SPACE_ID = 'space-1';
+const VIEW = PermissionBits.VIEW_CHANNEL;
+const SEND = PermissionBits.SEND_MESSAGES;
+
+const space: TaggedSpace = {
+  id: SPACE_ID, name: 'Aether Drift', icon: null, banner: null, avatarColor: 'lavender', ownerId: 'owner',
+  inviteCode: null, visibility: 'public', directoryListed: false, description: '', createdAt: 1, _instanceOrigin: '',
+};
+const channel: Channel = { id: 'channel-1', spaceId: SPACE_ID, name: 'events', type: 'text', topic: null, position: 0, categoryId: null, createdAt: 1 };
+const category: ChannelCategory = { id: 'category-1', spaceId: SPACE_ID, name: 'Staff', position: 0, createdAt: 1 };
+
+function role(id: string, name: string, position: number): Role {
+  return { id, spaceId: SPACE_ID, name, color: '#c4b5fd', position, permissions: '0', createdAt: 1 };
+}
+
+function row(targetId: string, allow: bigint, deny: bigint): Row {
+  return { targetType: 'role', targetId, allow: permissionsToString(allow), deny: permissionsToString(deny) };
+}
+
+const everyoneRow = (): Row | undefined => rows.find((r) => r.targetId === SPACE_ID);
+
+type Kind = 'channel' | 'category';
+
+function open(kind: Kind): void {
+  const all = permissionsToString(ALL_PERMISSIONS);
+  useSpaceStore.setState({
+    spaces: [space],
+    currentSpaceId: SPACE_ID,
+    channels: [channel],
+    categories: [category],
+    roles: [role(SPACE_ID, '@everyone', 0), role('r-guest', 'Guests', 1), role('r-mod', 'Moderators', 3), role('r-member', 'Members', 2)],
+    members: [],
+    spacePermissions: new Map([[SPACE_ID, all]]),
+    channelPermissions: new Map([['channel-1', all]]),
+  });
+  useUIStore.setState(kind === 'channel'
+    ? { activeModal: 'channelSettings', modalData: { channelId: 'channel-1' } }
+    : { activeModal: 'categorySettings', modalData: { categoryId: 'category-1' } });
+  render(kind === 'channel' ? <ChannelSettingsModal /> : <CategorySettingsModal />);
+}
+
+const privacySwitch = (): HTMLElement => screen.getByRole('switch');
+const lockNote = (kind: Kind) => screen.queryByText(kind === 'channel'
+  ? /This channel is hidden from members without explicit access/
+  : /This category is hidden from members without explicit access/);
+
+beforeEach(() => {
+  rows = [];
+  put.mockClear();
+  remove.mockClear();
+  get.mockClear();
+});
+
+describe.each<Kind>(['channel', 'category'])('%s privacy', (kind) => {
+  it('making it public clears only the View Channels deny and keeps the other @everyone bits', async () => {
+    rows = [row(SPACE_ID, 0n, VIEW | SEND)];
+    open(kind);
+    await waitFor(() => expect(privacySwitch()).toHaveAttribute('aria-checked', 'true'));
+
+    await userEvent.click(privacySwitch());
+
+    await waitFor(() => expect(privacySwitch()).toHaveAttribute('aria-checked', 'false'));
+    expect(remove).not.toHaveBeenCalled();
+    expect(stringToPermissions(everyoneRow()!.deny)).toBe(SEND);
+  });
+
+  it('making it public removes the @everyone override when View Channels was its only bit', async () => {
+    rows = [row(SPACE_ID, 0n, VIEW)];
+    open(kind);
+    await waitFor(() => expect(privacySwitch()).toHaveAttribute('aria-checked', 'true'));
+
+    await userEvent.click(privacySwitch());
+
+    await waitFor(() => expect(everyoneRow()).toBeUndefined());
+    // The switch names the version of the row it changed.
+    expect(remove).toHaveBeenCalledWith(expect.any(String), 'role', SPACE_ID, overrideVersion(row(SPACE_ID, 0n, VIEW)));
+  });
+
+  it('making it private adds the View Channels deny to the @everyone bits already there', async () => {
+    rows = [row(SPACE_ID, PermissionBits.ADD_REACTIONS | VIEW, SEND)];
+    open(kind);
+    await waitFor(() => expect(get).toHaveBeenCalled());
+    await waitFor(() => expect(privacySwitch()).toHaveAttribute('aria-checked', 'false'));
+
+    await userEvent.click(privacySwitch());
+
+    await waitFor(() => expect(privacySwitch()).toHaveAttribute('aria-checked', 'true'));
+    expect(everyoneRow()).toEqual(row(SPACE_ID, PermissionBits.ADD_REACTIONS, VIEW | SEND));
+    // The write names the version of the row the switch changed (#365).
+    expect(put.mock.calls[0]![1].version).toBe(overrideVersion(row(SPACE_ID, PermissionBits.ADD_REACTIONS | VIEW, SEND)));
+  });
+
+  it('refuses to switch over an @everyone override someone else changed meanwhile, and says so', async () => {
+    rows = [row(SPACE_ID, 0n, SEND)];
+    open(kind);
+    await waitFor(() => expect(get).toHaveBeenCalled());
+    await waitFor(() => expect(privacySwitch()).toHaveAttribute('aria-checked', 'false'));
+    // Another admin adds a deny to the same row; this dialog still holds the old one.
+    rows = [row(SPACE_ID, 0n, SEND | PermissionBits.ATTACH_FILES)];
+
+    await userEvent.click(privacySwitch());
+
+    expect(await screen.findByText('Someone else changed these permissions. Review them and save again.')).toBeInTheDocument();
+    // Their change stands, and the switch shows the row as it is now.
+    expect(everyoneRow()).toEqual(row(SPACE_ID, 0n, SEND | PermissionBits.ATTACH_FILES));
+    expect(privacySwitch()).toHaveAttribute('aria-checked', 'false');
+  });
+
+  it('the Overview follows a save on the Permissions tab without reopening', async () => {
+    rows = [row(SPACE_ID, 0n, VIEW)];
+    open(kind);
+    await waitFor(() => expect(privacySwitch()).toHaveAttribute('aria-checked', 'true'));
+    expect(lockNote(kind)).not.toBeNull();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Permissions' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove override for @everyone' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(everyoneRow()).toBeUndefined());
+    await userEvent.click(screen.getByRole('button', { name: 'Overview' }));
+
+    await waitFor(() => expect(privacySwitch()).toHaveAttribute('aria-checked', 'false'));
+    expect(lockNote(kind)).toBeNull();
+  });
+
+  it('lists role overrides in rank order, highest first and @everyone last', async () => {
+    rows = [row(SPACE_ID, 0n, SEND), row('r-guest', SEND, 0n), row('r-mod', SEND, 0n), row('r-member', SEND, 0n)];
+    open(kind);
+    await userEvent.click(screen.getByRole('button', { name: 'Permissions' }));
+    await screen.findByRole('button', { name: 'Remove override for Moderators' });
+
+    const names = screen.getAllByRole('button', { name: /^Remove override for / })
+      .map((b) => b.getAttribute('aria-label')!.replace('Remove override for ', ''));
+    expect(names).toEqual(['Moderators', 'Members', 'Guests', '@everyone']);
+    expect(within(document.body).queryAllByRole('button', { name: /^Remove override for / })).toHaveLength(4);
+  });
+});
