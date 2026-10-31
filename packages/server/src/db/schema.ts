@@ -1,0 +1,799 @@
+import { sqliteTable, text, integer, primaryKey, foreignKey, real, unique, index, uniqueIndex } from 'drizzle-orm/sqlite-core';
+import { sql } from 'drizzle-orm';
+
+export const users = sqliteTable('users', {
+  id: text('id').primaryKey(),
+  username: text('username').unique().notNull(),
+  displayName: text('display_name'),
+  passwordHash: text('password_hash').notNull(),
+  avatar: text('avatar'),
+  /** Live presence: the chosen status while connected, 'offline' with no connection. */
+  status: text('status').default('offline'),
+  /**
+   * The status the user picked ('online' | 'idle' | 'dnd'). Survives disconnects
+   * and restarts; published as `status` when a connection authenticates.
+   * Meaningful only on rows that own their choice (native or detached,
+   * `ownsChosenStatus` in @patogh/shared): a replicated row's copy is never
+   * read or written.
+   */
+  chosenStatus: text('chosen_status').notNull().default('online'),
+  customStatus: text('custom_status'),
+  isAdmin: integer('is_admin').default(0),
+  homeInstance: text('home_instance'),
+  homeUserId: text('home_user_id'),
+  replicatedInstances: text('replicated_instances').default('[]'),
+  banner: text('banner'),
+  accentColor: text('accent_color'),
+  avatarColor: text('avatar_color'),
+  bio: text('bio'),
+  isDeleted: integer('is_deleted').default(0),
+  discoverable: integer('discoverable').default(1),
+  profileUpdatedAt: integer('profile_updated_at'),
+  passwordChangedAt: integer('password_changed_at'),
+  showActivity: integer('show_activity').notNull().default(1),
+  federationRegistryUpdatedAt: integer('federation_registry_updated_at').default(0),
+  federationHealPending: integer('federation_heal_pending').default(0),
+  federationHomeOrphaned: integer('federation_home_orphaned').default(0),
+  /**
+   * The identity a detached account (`federation_home_orphaned = 1`) had before
+   * it was detached: its former home instance and its id there. Detaching
+   * moves `home_instance`/`home_user_id` here and clears them, so the row is
+   * homed on this instance and presents itself to peers as one of its users
+   * (federation.md, "Detached accounts are homed here"). Read only to resolve
+   * a reference to the former identity back to this row (`resolveRelayActor`),
+   * for re-attach, and for the reset-cleanup admin listing. Kept on a
+   * tombstone; cleared by re-attach.
+   */
+  detachedHomeInstance: text('detached_home_instance'),
+  detachedHomeUserId: text('detached_home_user_id'),
+  createdAt: integer('created_at').notNull(),
+}, (table) => ({
+  /**
+   * Every federated identity lookup starts with `home_user_id = ?`
+   * (`resolveRelayActor`, `resolveLocalUser`, the relay mention lists).
+   * Single column on purpose: a home user id matches about one row, and most
+   * pair lookups compare `home_instance` normalized or in code, where a
+   * composite's second column cannot be used.
+   */
+  homeUserIdx: index('idx_users_home_user_id').on(table.homeUserId),
+  /** `resolveRelayActor` matches a former (detached) identity in the same query as `home_user_id`. */
+  detachedHomeUserIdx: index('idx_users_detached_home_user_id').on(table.detachedHomeUserId),
+}));
+
+export const spaces = sqliteTable('spaces', {
+  id: text('id').primaryKey(),
+  name: text('name').notNull(),
+  icon: text('icon'),
+  banner: text('banner'),
+  avatarColor: text('avatar_color'),
+  ownerId: text('owner_id').notNull().references(() => users.id),
+  ownerTitle: text('owner_title'),
+  inviteCode: text('invite_code').unique(),
+  visibility: text('visibility').default('private'),
+  directoryListed: integer('directory_listed').notNull().default(0),
+  description: text('description'),
+  createdAt: integer('created_at').notNull(),
+});
+
+export const spaceMembers = sqliteTable('space_members', {
+  spaceId: text('space_id').notNull().references(() => spaces.id, { onDelete: 'cascade' }),
+  userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  nickname: text('nickname'),
+  joinedAt: integer('joined_at').notNull(),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.spaceId, table.userId] }),
+  userIdx: index('idx_space_members_user_id').on(table.userId),
+}));
+
+export const channelCategories = sqliteTable('channel_categories', {
+  id: text('id').primaryKey(),
+  spaceId: text('space_id').notNull().references(() => spaces.id, { onDelete: 'cascade' }),
+  name: text('name').notNull(),
+  position: integer('position').default(0),
+  createdAt: integer('created_at').notNull(),
+}, (table) => ({
+  spaceIdx: index('idx_channel_categories_space_id').on(table.spaceId),
+}));
+
+export const channels = sqliteTable('channels', {
+  id: text('id').primaryKey(),
+  spaceId: text('space_id').notNull().references(() => spaces.id, { onDelete: 'cascade' }),
+  name: text('name').notNull(),
+  type: text('type').notNull(),
+  topic: text('topic'),
+  position: integer('position').default(0),
+  categoryId: text('category_id'),
+  createdAt: integer('created_at').notNull(),
+}, (table) => ({
+  spaceIdx: index('idx_channels_space_id').on(table.spaceId),
+}));
+
+export const messages = sqliteTable('messages', {
+  id: text('id').primaryKey(),
+  channelId: text('channel_id').notNull().references(() => channels.id, { onDelete: 'cascade' }),
+  userId: text('user_id').notNull().references(() => users.id),
+  replyToId: text('reply_to_id'),
+  content: text('content'),
+  type: text('type', { enum: ['user', 'system'] }).notNull().default('user'),
+  editedAt: integer('edited_at'),
+  createdAt: integer('created_at').notNull(),
+}, (table) => ({
+  replyToFk: foreignKey({
+    columns: [table.replyToId],
+    foreignColumns: [table.id],
+  }).onDelete('set null'),
+  channelIdx: index('idx_messages_channel_id').on(table.channelId),
+  userIdx: index('idx_messages_user_id').on(table.userId),
+  // Unread counts (ws/channelUnreadCounts.ts): the messages of a channel after
+  // a read cursor, compared as numbers, with the author to leave out the
+  // reader's own and the type to leave out system rows, so a count reads the
+  // index alone. The expression is unqualified because SQLite refuses a
+  // qualified column in an index expression, and the query must spell it
+  // `CAST(... AS INTEGER)` in this case for the planner to match it.
+  unreadIdx: index('idx_messages_channel_unread').on(table.channelId, sql`CAST(id AS INTEGER)`, table.userId, table.type),
+}));
+
+export const attachments = sqliteTable('attachments', {
+  id: text('id').primaryKey(),
+  messageId: text('message_id').references(() => messages.id, { onDelete: 'cascade' }),
+  dmMessageId: text('dm_message_id').references(() => dmMessages.id, { onDelete: 'cascade' }),
+  uploaderId: text('uploader_id'),
+  filename: text('filename').notNull(),
+  originalName: text('original_name').notNull(),
+  mimetype: text('mimetype').notNull(),
+  size: integer('size').notNull(),
+  thumbnailFilename: text('thumbnail_filename'),
+  width: integer('width'),
+  height: integer('height'),
+  duration: real('duration'),
+  // Tri-state web-playability for video attachments: 1 = decodable in a
+  // browser <video>, 0 = known-undecodable (e.g. HEVC .mov), NULL = unknown
+  // (codec unprobed / non-video). Drives the client's download fallback.
+  playable: integer('playable', { mode: 'boolean' }),
+  sourceUrl: text('source_url'),
+  federationStatus: text('federation_status'),
+  federationMeta: text('federation_meta'),
+  createdAt: integer('created_at').notNull(),
+}, (table) => ({
+  messageIdx: index('idx_attachments_message_id').on(table.messageId),
+  dmMessageIdx: index('idx_attachments_dm_message_id').on(table.dmMessageId),
+}));
+
+export const embeds = sqliteTable('embeds', {
+  id: text('id').primaryKey(),
+  messageId: text('message_id').references(() => messages.id, { onDelete: 'cascade' }),
+  dmMessageId: text('dm_message_id').references(() => dmMessages.id, { onDelete: 'cascade' }),
+  url: text('url').notNull(),
+  embedType: text('embed_type').notNull(),
+  provider: text('provider'),
+  title: text('title'),
+  description: text('description'),
+  image: text('image'),
+  embedUrl: text('embed_url'),
+  width: integer('width'),
+  height: integer('height'),
+  color: text('color'),
+  createdAt: integer('created_at').notNull(),
+}, (table) => ({
+  messageIdx: index('idx_embeds_message_id').on(table.messageId),
+  dmMessageIdx: index('idx_embeds_dm_message_id').on(table.dmMessageId),
+}));
+
+export const dmChannels = sqliteTable('dm_channels', {
+  id: text('id').primaryKey(),
+  ownerId: text('owner_id'),
+  federatedId: text('federated_id'),
+  ownerHomeUserId: text('owner_home_user_id'),
+  ownerHomeInstance: text('owner_home_instance'),
+  deletedAt: integer('deleted_at'),
+  createdAt: integer('created_at').notNull(),
+  name: text('name'),
+  icon: text('icon'),
+  metadataUpdatedAt: integer('metadata_updated_at').default(0).notNull(),
+}, (table) => ({
+  federatedIdx: uniqueIndex('idx_dm_federated')
+    .on(table.federatedId)
+    .where(sql`federated_id IS NOT NULL`),
+}));
+
+export const dmMembers = sqliteTable('dm_members', {
+  dmChannelId: text('dm_channel_id').notNull().references(() => dmChannels.id, { onDelete: 'cascade' }),
+  userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  closed: integer('closed').default(0),
+  // When `closed` last took its current value, for last-writer-wins against a
+  // relayed dm_close / dm_reopen: the member's own action or the membership's
+  // start (local clock), or the relayed event's timestamp. Written only through
+  // utils/dmMemberClosed.ts.
+  closedChangedAt: integer('closed_changed_at').notNull().default(0),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.dmChannelId, table.userId] }),
+  userIdx: index('idx_dm_members_user_id').on(table.userId),
+}));
+
+export const dmMessages = sqliteTable('dm_messages', {
+  id: text('id').primaryKey(),
+  dmChannelId: text('dm_channel_id').notNull().references(() => dmChannels.id, { onDelete: 'cascade' }),
+  userId: text('user_id').notNull().references(() => users.id),
+  replyToId: text('reply_to_id'),
+  content: text('content'),
+  type: text('type').notNull().default('user'),
+  editedAt: integer('edited_at'),
+  sourceInstance: text('source_instance'),
+  sourceMessageId: text('source_message_id'),
+  encryptionVersion: integer('encryption_version').default(0),
+  createdAt: integer('created_at').notNull(),
+}, (table) => ({
+  replyToFk: foreignKey({
+    columns: [table.replyToId],
+    foreignColumns: [table.id],
+  }).onDelete('set null'),
+  channelIdx: index('idx_dm_messages_dm_channel_id').on(table.dmChannelId),
+  userIdx: index('idx_dm_messages_user_id').on(table.userId),
+  // Unread counts, as idx_messages_channel_unread above.
+  unreadIdx: index('idx_dm_messages_channel_unread').on(table.dmChannelId, sql`CAST(id AS INTEGER)`, table.userId),
+  sourceUniqueIdx: uniqueIndex('idx_dm_messages_source_unique')
+    .on(table.sourceInstance, table.sourceMessageId)
+    .where(sql`source_instance IS NOT NULL`),
+}));
+
+export const friends = sqliteTable('friends', {
+  userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  friendId: text('friend_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  createdAt: integer('created_at').notNull(),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.userId, table.friendId] }),
+  userIdx: index('idx_friends_user_id').on(table.userId),
+  friendIdx: index('idx_friends_friend_id').on(table.friendId),
+}));
+
+export const friendRequests = sqliteTable('friend_requests', {
+  id: text('id').primaryKey(),
+  fromId: text('from_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  toId: text('to_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  status: text('status').default('pending'), // 'pending', 'accepted', 'declined'
+  createdAt: integer('created_at').notNull(),
+  relayMessageId: text('relay_message_id'),  // entityId of the originating relay event; null for local-only requests. Used by the rollback hook in federationRollback.ts to find rows for deletion when a federated friend_request_create is permanently rejected.
+}, (table) => ({
+  toIdx: index('idx_friend_requests_to_id').on(table.toId),
+  fromIdx: index('idx_friend_requests_from_id').on(table.fromId),
+  relayMessageIdx: index('idx_friend_requests_relay_message_id').on(table.relayMessageId),
+}));
+
+export const reactions = sqliteTable('reactions', {
+  id: text('id').primaryKey(),
+  messageId: text('message_id').notNull().references(() => messages.id, { onDelete: 'cascade' }),
+  userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  emoji: text('emoji').notNull(),
+  createdAt: integer('created_at').notNull(),
+}, (table) => ({
+  messageIdx: index('idx_reactions_message_id').on(table.messageId),
+  // One reaction per user, emoji and message. A repeat insert is refused.
+  messageUserEmojiIdx: uniqueIndex('idx_reactions_message_user_emoji').on(table.messageId, table.userId, table.emoji),
+}));
+
+export const dmReactions = sqliteTable('dm_reactions', {
+  id: text('id').primaryKey(),
+  dmMessageId: text('dm_message_id').notNull().references(() => dmMessages.id, { onDelete: 'cascade' }),
+  userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  emoji: text('emoji').notNull(),
+  createdAt: integer('created_at').notNull(),
+}, (table) => ({
+  dmMessageIdx: index('idx_dm_reactions_dm_message_id').on(table.dmMessageId),
+  // One reaction per user, emoji and message. A repeat insert is refused.
+  dmMessageUserEmojiIdx: uniqueIndex('idx_dm_reactions_message_user_emoji').on(table.dmMessageId, table.userId, table.emoji),
+}));
+
+export const roles = sqliteTable('roles', {
+  id: text('id').primaryKey(),
+  spaceId: text('space_id').notNull().references(() => spaces.id, { onDelete: 'cascade' }),
+  name: text('name').notNull(),
+  color: text('color').default('#b9bbbe'),
+  position: integer('position').default(0),
+  permissions: text('permissions'), // JSON string of permission keys
+  createdAt: integer('created_at').notNull(),
+}, (table) => ({
+  spaceIdx: index('idx_roles_space_id').on(table.spaceId),
+}));
+
+export const memberRoles = sqliteTable('member_roles', {
+  spaceId: text('space_id').notNull().references(() => spaces.id, { onDelete: 'cascade' }),
+  userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  roleId: text('role_id').notNull().references(() => roles.id, { onDelete: 'cascade' }),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.spaceId, table.userId, table.roleId] }),
+  userSpaceIdx: index('idx_member_roles_user_id_space_id').on(table.userId, table.spaceId),
+}));
+
+export const channelOverrides = sqliteTable('channel_overrides', {
+  channelId: text('channel_id').notNull().references(() => channels.id, { onDelete: 'cascade' }),
+  targetType: text('target_type').notNull(), // 'role' | 'member'
+  targetId: text('target_id').notNull(), // role ID or user ID
+  allow: text('allow').notNull().default('0'), // BigInt decimal string
+  deny: text('deny').notNull().default('0'), // BigInt decimal string
+}, (table) => ({
+  pk: primaryKey({ columns: [table.channelId, table.targetType, table.targetId] }),
+  channelIdx: index('idx_channel_overrides_channel_id').on(table.channelId),
+}));
+
+export const categoryOverrides = sqliteTable('category_overrides', {
+  categoryId: text('category_id').notNull().references(() => channelCategories.id, { onDelete: 'cascade' }),
+  targetType: text('target_type').notNull(),
+  targetId: text('target_id').notNull(),
+  allow: text('allow').notNull().default('0'),
+  deny: text('deny').notNull().default('0'),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.categoryId, table.targetType, table.targetId] }),
+  categoryIdx: index('idx_category_overrides_category_id').on(table.categoryId),
+}));
+
+export const readStates = sqliteTable('read_states', {
+  userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  channelId: text('channel_id').notNull(),
+  lastReadMessageId: text('last_read_message_id').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.userId, table.channelId] }),
+  userIdx: index('idx_read_states_user_id').on(table.userId),
+}));
+
+/**
+ * A user's notification setting for a space (`channel_id` NULL) or for one
+ * channel of it. Lives on the instance that hosts the space and is keyed by
+ * the user's row here (for a federated member, their account on this
+ * instance). `level` NULL is "not chosen": the channel inherits the space,
+ * the space uses the default. `muted` with `muted_until` NULL lasts until
+ * lifted. A row with no choice left is deleted, not kept.
+ * See docs/systems/sounds.md ("Notification settings").
+ */
+export const notificationSettings = sqliteTable('notification_settings', {
+  userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  spaceId: text('space_id').notNull().references(() => spaces.id, { onDelete: 'cascade' }),
+  channelId: text('channel_id').references(() => channels.id, { onDelete: 'cascade' }),
+  level: text('level'),
+  muted: integer('muted').notNull().default(0),
+  mutedUntil: integer('muted_until'),
+  suppressEveryone: integer('suppress_everyone').notNull().default(0),
+  suppressRoles: integer('suppress_roles').notNull().default(0),
+  updatedAt: integer('updated_at').notNull(),
+}, (table) => ({
+  // One space-wide row and one row per channel, per user. Two partial
+  // indexes because a NULL channel_id never collides in a plain unique index.
+  spaceRowIdx: uniqueIndex('idx_notification_settings_space_row')
+    .on(table.userId, table.spaceId)
+    .where(sql`${table.channelId} IS NULL`),
+  channelRowIdx: uniqueIndex('idx_notification_settings_channel_row')
+    .on(table.userId, table.channelId)
+    .where(sql`${table.channelId} IS NOT NULL`),
+}));
+
+export const spaceFolders = sqliteTable('space_folders', {
+  id: text('id').primaryKey(),
+  userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  name: text('name'),
+  color: text('color'),
+  position: integer('position').default(0),
+  createdAt: integer('created_at').notNull(),
+});
+
+export const spaceFolderMembers = sqliteTable('space_folder_members', {
+  folderId: text('folder_id').notNull().references(() => spaceFolders.id, { onDelete: 'cascade' }),
+  spaceId: text('space_id').notNull(), // No FK — federated space IDs don't exist locally
+  position: integer('position').default(0),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.folderId, table.spaceId] }),
+}));
+
+export const userSpaceLayout = sqliteTable('user_space_layout', {
+  userId: text('user_id').primaryKey().references(() => users.id, { onDelete: 'cascade' }),
+  layout: text('layout').notNull().default('[]'),
+  updatedAt: integer('updated_at').notNull(),
+});
+
+export const instanceSettings = sqliteTable('instance_settings', {
+  id: integer('id').primaryKey().default(1),
+  instanceName: text('instance_name').default('Patogh'),
+  workerId: integer('worker_id'),
+  instanceId: text('instance_id'),
+  discoveryEnabled: integer('discovery_enabled').notNull().default(1),
+  maxBitrateKbps: integer('max_bitrate_kbps').notNull().default(20000),
+  minBitrateKbps: integer('min_bitrate_kbps').notNull().default(500),
+  bitrateStepKbps: integer('bitrate_step_kbps').notNull().default(500),
+  allowedResolutions: text('allowed_resolutions').notNull().default('540,720,1080'),
+  allowedFramerates: text('allowed_framerates').notNull().default('30,45,60'),
+  maxResolution: integer('max_resolution').notNull().default(1080),
+  maxFramerate: integer('max_framerate').notNull().default(60),
+  registrationOpen: integer('registration_open'),  // null = use env var default, 0/1 = explicit
+  federatedRegistrationOpen: integer('federated_registration_open').notNull().default(1),
+  gifApiKey: text('gif_api_key'),
+  bitrateMatrixOverrides: text('bitrate_matrix_overrides'),
+  allowCustomBitrate: integer('allow_custom_bitrate').notNull().default(1),
+  maxUploadSizeBytes: integer('max_upload_size_bytes'),
+  federationRelayEnabled: integer('federation_relay_enabled').notNull().default(1),
+  federationRelayTtlDays: integer('federation_relay_ttl_days').notNull().default(30),
+  defaultAutoRotateIntervalDays: integer('default_auto_rotate_interval_days').notNull().default(90),
+  autoAcceptPeering: integer('auto_accept_peering').notNull().default(1),
+  /** The admin allows spaces on this instance to be listed in the directory. */
+  directoryEnabled: integer('directory_enabled').notNull().default(0),
+  /** A directory ping is owed. Survives restarts and the toggle being off. */
+  directoryDirty: integer('directory_dirty').notNull().default(0),
+  /** ms timestamp of the last successful directory ping. */
+  directoryLastPingAt: integer('directory_last_ping_at'),
+  /** JSON DirectoryPingError of the last failed ping, null after a success. */
+  directoryLastError: text('directory_last_error'),
+  /** People on this instance see spaces from other instances in Explore. */
+  directoryBrowseEnabled: integer('directory_browse_enabled').notNull().default(1),
+  /** The web client's Patogh page shows the Support card. Hides only that card; the server does nothing else with it. */
+  supportCardEnabled: integer('support_card_enabled', { mode: 'boolean' }).notNull().default(true),
+  /** First-boot timestamp (ms); backfilled by ensureDefaults, so non-null after boot. */
+  installedAt: integer('installed_at'),
+  /** The instance owner: the first local account. Other admins cannot demote, delete, or reset it. */
+  ownerUserId: text('owner_user_id'),
+  /** The instance's one space: created for the owner, every local user joins it. */
+  mainSpaceId: text('main_space_id'),
+  /**
+   * When this instance began recording applied relay events in
+   * `federation_applied_events` (ms): the upgrade that ran migration 0022.
+   * Null on an instance that recorded them from its first boot. A friend
+   * event applied before it cannot be recognized, so the pull never reads a
+   * peer's friend events from before it (utils/federationSync.ts).
+   */
+  ledgerStartedAt: integer('ledger_started_at'),
+  updatedAt: integer('updated_at').notNull(),
+});
+
+export const bans = sqliteTable('bans', {
+  spaceId: text('space_id').notNull().references(() => spaces.id, { onDelete: 'cascade' }),
+  userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  reason: text('reason'),
+  bannedBy: text('banned_by').references(() => users.id),
+  createdAt: integer('created_at').notNull(),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.spaceId, table.userId] }),
+  spaceIdx: index('idx_bans_space_id').on(table.spaceId),
+}));
+
+export const joinRequests = sqliteTable('join_requests', {
+  id: text('id').primaryKey(),
+  spaceId: text('space_id').notNull().references(() => spaces.id, { onDelete: 'cascade' }),
+  userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  message: text('message'),
+  status: text('status').notNull().default('pending'),
+  decidedBy: text('decided_by').references(() => users.id),
+  createdAt: integer('created_at').notNull(),
+  decidedAt: integer('decided_at'),
+}, (table) => ({
+  spaceStatusIdx: index('idx_join_requests_space_id_status').on(table.spaceId, table.status),
+}));
+
+export const voiceRestrictions = sqliteTable('voice_restrictions', {
+  spaceId: text('space_id').notNull().references(() => spaces.id, { onDelete: 'cascade' }),
+  userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  restrictionType: text('restriction_type').notNull(), // 'mute' | 'deafen'
+  moderatorId: text('moderator_id').references(() => users.id),
+  createdAt: integer('created_at').notNull(),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.spaceId, table.userId, table.restrictionType] }),
+  spaceIdx: index('idx_voice_restrictions_space_id').on(table.spaceId),
+}));
+
+export const federationPeers = sqliteTable('federation_peers', {
+  id: text('id').primaryKey(),
+  origin: text('origin').notNull().unique(),
+  instanceName: text('instance_name'),
+  hmacSecret: text('hmac_secret').notNull(),
+  status: text('status').notNull().default('active'),
+  // Who caused this row to exist. Only 'admin' is proof that a local admin
+  // deliberately authorized peering with this origin, which is what the
+  // inbound /peer/accept gate consults when autoAcceptPeering = 0:
+  //   'admin'  — POST /peer/initiate, or an approval/denial decision in
+  //              routes/federation/handlers/approvals.ts.
+  //   'auto'   — created by local traffic without an admin decision: the
+  //              outbox placeholder, or ensurePeered() auto-peering.
+  //   'remote' — created by an inbound /peer/accept from the remote itself.
+  // Rows that predate this column read as 'auto' (fail closed): a stale
+  // pending row cannot stand in for an admin decision.
+  initiatedBy: text('initiated_by', { enum: ['admin', 'auto', 'remote'] }).notNull().default('auto'),
+  lastSeenAt: integer('last_seen_at'),
+  lastFailureAt: integer('last_failure_at'),
+  consecutiveFailures: integer('consecutive_failures').notNull().default(0),
+  consecutiveAuthFailures: integer('consecutive_auth_failures').notNull().default(0),
+  lastProbeAt: integer('last_probe_at'),
+  probeAttempts: integer('probe_attempts').notNull().default(0),
+  lastSyncedAt: integer('last_synced_at').default(0),
+  remoteMaxUploadSize: integer('remote_max_upload_size'),
+  nonceSupported: integer('nonce_supported').notNull().default(0),
+  pendingHmacSecret: text('pending_hmac_secret'),
+  secretRotationAt: integer('secret_rotation_at'),
+  secretRotatedAt: integer('secret_rotated_at'),
+  autoRotateIntervalDays: integer('auto_rotate_interval_days').notNull().default(90),
+  createdAt: integer('created_at').notNull(),
+  approvalToken: text('approval_token'),
+  peerInstanceId: text('peer_instance_id'),
+  observedPeerInstanceId: text('observed_peer_instance_id'),
+  // Why the row is in its status, for the statuses that carry a reason
+  // (needs_attention, rejected); NULL for every other status. Written only by
+  // utils/federationPeerState.ts. See docs/systems/federation.md, "Peer state".
+  statusReason: text('status_reason'),
+});
+
+// Pull-sync position per peer and context ('dm' | 'friend' | 'profile'): the
+// peer's mutation-log row last consumed, in the PEER's clock (`mutated_at`)
+// with its row id as the tiebreak. `peerEpoch` is the peer's instance id the
+// cursor was taken against; a different epoch restarts the cursor at 0.
+// See utils/federationSync.ts.
+export const federationSyncCursors = sqliteTable('federation_sync_cursors', {
+  peerId: text('peer_id').notNull().references(() => federationPeers.id, { onDelete: 'cascade' }),
+  contextType: text('context_type').notNull(),
+  cursorTs: integer('cursor_ts').notNull().default(0),
+  cursorId: text('cursor_id'),
+  peerEpoch: text('peer_epoch'),
+  lastPulledAt: integer('last_pulled_at'),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.peerId, table.contextType] }),
+}));
+
+// Pulled events a receiver refused for a reason that can pass later, kept
+// with the whole event and replayed locally in the peer's order within each
+// subject (`subjectKey`, the unit utils/federationSync.ts orders pulled events
+// in). A subject with a row here holds its later pulled events behind it.
+// One row per distinct event: `eventHash` is the sha256 of the event's
+// canonical JSON, so a re-read of a kept event adds nothing and two events
+// that share a type, message and millisecond (two reactions, two rejected
+// attachments) are both kept.
+export const federationSyncRetry = sqliteTable('federation_sync_retry', {
+  id: text('id').primaryKey(),
+  peerId: text('peer_id').notNull().references(() => federationPeers.id, { onDelete: 'cascade' }),
+  contextType: text('context_type').notNull(),
+  subjectKey: text('subject_key').notNull(),
+  eventType: text('event_type').notNull(),
+  messageId: text('message_id').notNull(),
+  eventTs: integer('event_ts').notNull(),
+  eventHash: text('event_hash').notNull(),
+  eventJson: text('event_json').notNull(),
+  lastReason: text('last_reason').notNull(),
+  attempts: integer('attempts').notNull().default(1),
+  firstFailedAt: integer('first_failed_at').notNull(),
+  nextRetryAt: integer('next_retry_at').notNull(),
+}, (table) => ({
+  eventIdx: uniqueIndex('idx_sync_retry_event').on(table.peerId, table.eventHash),
+  subjectIdx: index('idx_sync_retry_subject').on(table.peerId, table.subjectKey),
+  orderIdx: index('idx_sync_retry_order').on(table.peerId, table.eventTs),
+}));
+
+// Relay events this instance has applied (or a tombstone standing for one),
+// for events whose processors cannot tell a second delivery from state alone:
+// friend events, and the delete of a message not held here, which answers a
+// later create of it as a duplicate. Keyed by the normalized origin the event
+// is attributed to. Swept by the janitor after 100 days, longer than the
+// 90-day mutation log the pull reads.
+export const federationAppliedEvents = sqliteTable('federation_applied_events', {
+  sourceOrigin: text('source_origin').notNull(),
+  eventKey: text('event_key').notNull(),
+  appliedAt: integer('applied_at').notNull(),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.sourceOrigin, table.eventKey] }),
+  appliedAtIdx: index('idx_applied_events_applied_at').on(table.appliedAt),
+}));
+
+// The last applied change per federated subject: a group member (the group's
+// federatedId + the member's identity) or a friend pair (both identities).
+// Relayed member and friend events apply last-writer-wins against it, on the
+// live relay and the pull alike; local changes record it too. `changedAt` is
+// the change's own timestamp (the relayed event's, or local time for a change
+// made here); `recordedAt` is the local time of the write, for the sweep.
+// Written only through utils/federationSubjectClock.ts.
+export const federationSubjectClocks = sqliteTable('federation_subject_clocks', {
+  subjectKey: text('subject_key').primaryKey(),
+  changedAt: integer('changed_at').notNull(),
+  recordedAt: integer('recorded_at').notNull(),
+}, (table) => ({
+  recordedAtIdx: index('idx_subject_clocks_recorded_at').on(table.recordedAt),
+}));
+
+// Records a detected federated-peer reset (same origin, new instance epoch).
+// One row per origin; upserted when a live epoch change is observed, resolved
+// once stale replicated identities are healed.
+export const federationResetEvents = sqliteTable('federation_reset_events', {
+  origin: text('origin').primaryKey(),
+  deadEpoch: text('dead_epoch').notNull(),
+  newEpoch: text('new_epoch'),
+  detectedAt: integer('detected_at').notNull(),
+  resolvedAt: integer('resolved_at'),
+  stubCount: integer('stub_count').notNull().default(0),
+  orphanedAccountCount: integer('orphaned_account_count').notNull().default(0),
+  acknowledgedAt: integer('acknowledged_at'),
+});
+
+// One-time proof tokens for detached-account re-attach (re-attach spec §3.1).
+// Minted by POST /api/auth/attach-proof for a logged-in native user, verified
+// once by a peer via POST /api/federation/verify-attach-proof. Expired/used
+// rows are deleted opportunistically on each mint.
+export const federationAttachProofs = sqliteTable('federation_attach_proofs', {
+  token: text('token').primaryKey(),
+  homeUserId: text('home_user_id').notNull(),
+  targetDomain: text('target_domain').notNull(),
+  createdAt: integer('created_at').notNull(),
+  expiresAt: integer('expires_at').notNull(),
+  usedAt: integer('used_at'),
+});
+
+// SQL-level CHECK constraint enforces (direction='inbound' → hmac_secret NOT NULL).
+// See packages/server/drizzle/0003_brave_inhumans.sql. drizzle-kit cannot represent
+// CHECK constraints in its snapshot, so any future migration that recreates this
+// table MUST re-add the CHECK clause by hand. The snapshot WILL silently drop it
+// otherwise.
+export const peerApprovalRequests = sqliteTable('peer_approval_requests', {
+  id: text('id').primaryKey(),
+  origin: text('origin').notNull(),
+  direction: text('direction', { enum: ['inbound', 'outbound'] }).notNull().default('inbound'),
+  instanceName: text('instance_name'),
+  hmacSecret: text('hmac_secret'),
+  requestedAt: integer('requested_at').notNull(),
+  expiresAt: integer('expires_at').notNull(),
+  approvalToken: text('approval_token'),
+}, (table) => ({
+  uniqOriginDirection: unique().on(table.origin, table.direction),
+}));
+
+export const peerApprovalSubscribers = sqliteTable('peer_approval_subscribers', {
+  id: text('id').primaryKey(),
+  requestId: text('request_id').notNull().references(() => peerApprovalRequests.id, { onDelete: 'cascade' }),
+  userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  triggerReason: text('trigger_reason').notNull(),
+  triggerTarget: text('trigger_target').notNull(),
+  createdAt: integer('created_at').notNull(),
+}, (table) => ({
+  uniqSubscription: unique().on(table.requestId, table.userId, table.triggerReason, table.triggerTarget),
+  userIdx: index('idx_peer_approval_subscribers_user_id').on(table.userId),
+}));
+
+export const peerApprovalNotifications = sqliteTable('peer_approval_notifications', {
+  id: text('id').primaryKey(),
+  userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  kind: text('kind', { enum: ['approved', 'denied', 'expired'] }).notNull(),
+  peerOrigin: text('peer_origin').notNull(),
+  triggerReason: text('trigger_reason').notNull(),
+  triggerTarget: text('trigger_target').notNull(),
+  createdAt: integer('created_at').notNull(),
+  readAt: integer('read_at'),
+}, (table) => ({
+  userIdx: index('idx_peer_approval_notifications_user_id').on(table.userId),
+}));
+
+export const federationOutbox = sqliteTable('federation_outbox', {
+  id: text('id').primaryKey(),
+  peerId: text('peer_id').notNull().references(() => federationPeers.id, { onDelete: 'cascade' }),
+  contextId: text('context_id').notNull(),
+  /** The id the peer knows the event by (the relay event's `messageId`). */
+  entityId: text('entity_id').notNull(),
+  /**
+   * The queue the row belongs to: the events of one entity, sent one at a
+   * time in order and folded only by the rules in federationOutboxQueue.ts.
+   * Derived there from the event (`outboxQueueKey`). Null only on rows queued
+   * before the column existed, until the boot backfill fills it.
+   */
+  queueKey: text('queue_key'),
+  contextType: text('context_type').notNull().default('dm'),
+  eventType: text('event_type').notNull(),
+  payload: text('payload').notNull(),
+  encryptionVersion: integer('encryption_version').default(0),
+  attempts: integer('attempts').default(0),
+  nextRetryAt: integer('next_retry_at').notNull(),
+  expiresAt: integer('expires_at').notNull(),
+  createdAt: integer('created_at').notNull(),
+  /**
+   * When some path first possibly handed this event to the peer: the worker
+   * putting it on the wire, or the peer pulling `/sync`. Null: the peer
+   * cannot have it. Never cleared.
+   */
+  offeredAt: integer('offered_at'),
+}, (table) => ({
+  queueIdx: index('idx_outbox_queue').on(table.peerId, table.queueKey, table.createdAt),
+  retryIdx: index('idx_outbox_retry').on(table.nextRetryAt),
+}));
+
+export const federationFileQueue = sqliteTable('federation_file_queue', {
+  id: text('id').primaryKey(),
+  peerOrigin: text('peer_origin').notNull(),
+  dmMessageId: text('dm_message_id').notNull(),
+  sourceUrl: text('source_url').notNull(),
+  targetFilename: text('target_filename'),
+  originalName: text('original_name').notNull(),
+  mimetype: text('mimetype').notNull(),
+  size: integer('size').notNull(),
+  status: text('status').notNull().default('pending'),
+  rejectionReason: text('rejection_reason'),
+  attempts: integer('attempts').default(0),
+  nextRetryAt: integer('next_retry_at').notNull(),
+  expiresAt: integer('expires_at').notNull(),
+  createdAt: integer('created_at').notNull(),
+});
+
+export const federationMutationLog = sqliteTable('federation_mutation_log', {
+  id: text('id').primaryKey(),
+  entityId: text('entity_id').notNull(),
+  contextId: text('context_id').notNull(),
+  contextType: text('context_type').notNull().default('dm'),
+  mutationType: text('mutation_type').notNull(),
+  mutatedAt: integer('mutated_at').notNull(),
+  payload: text('payload'),
+}, (table) => ({
+  timeIdx: index('idx_mutation_log_time').on(table.mutatedAt),
+}));
+
+export const userFederationRegistry = sqliteTable('user_federation_registry', {
+  userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  origin: text('origin').notNull(),
+  label: text('label').notNull().default(''),
+  username: text('username').notNull().default(''),
+  remoteUserId: text('remote_user_id').notNull().default(''),
+  status: text('status').notNull().default('connected'),
+  addedAt: integer('added_at').notNull(),
+  lastConnectedAt: integer('last_connected_at'),
+  disconnectedAt: integer('disconnected_at'),
+  errorMessage: text('error_message'),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.userId, table.origin] }),
+}));
+
+// Per-remote credential this user's client presents when registering or logging
+// in as itself on ANOTHER instance. Home-instance-only state: the row is written
+// and read exclusively by the account's own home instance, is never federated,
+// and never leaves the home server except to the account's authenticated client.
+//
+// Why it exists: the client used to reuse the account's home password verbatim
+// for every remote it connected to, handing a reusable home credential to every
+// remote operator. Each remote now gets its own high-entropy secret with no
+// relationship to the home password or to any other remote's secret.
+//
+// `provisionedAt` is the migration marker: NULL means the remote account may
+// still be carrying a credential this instance did not issue (a pre-existing
+// connection), so the client rotates it the next time it holds a live session
+// there. Set once the remote account is known to use `secret`.
+export const userFederationCredentials = sqliteTable('user_federation_credentials', {
+  userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  origin: text('origin').notNull(),
+  secret: text('secret').notNull(),
+  createdAt: integer('created_at').notNull(),
+  provisionedAt: integer('provisioned_at'),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.userId, table.origin] }),
+}));
+
+export const inviteLinks = sqliteTable('invite_links', {
+  id: text('id').primaryKey(),
+  token: text('token').notNull().unique(),
+  name: text('name').notNull(),
+  createdBy: text('created_by').notNull().references(() => users.id),
+  createdAt: integer('created_at').notNull(),
+  maxUses: integer('max_uses'),
+  usedCount: integer('used_count').notNull().default(0),
+  expiresAt: integer('expires_at'),
+  revokedAt: integer('revoked_at'),
+}, (table) => ({
+  createdAtIdx: index('idx_invite_links_created_at').on(table.createdAt),
+}));
+
+export const inviteRedemptions = sqliteTable('invite_redemptions', {
+  id: text('id').primaryKey(),
+  inviteId: text('invite_id').notNull().references(() => inviteLinks.id, { onDelete: 'cascade' }),
+  userId: text('user_id').references(() => users.id, { onDelete: 'set null' }),
+  registrantUsername: text('registrant_username').notNull(),
+  redeemedAt: integer('redeemed_at').notNull(),
+}, (table) => ({
+  inviteIdx: index('idx_invite_redemptions_invite_id').on(table.inviteId),
+  userIdx: index('idx_invite_redemptions_user_id').on(table.userId),
+}));
+
+// Assets outlive personal collections so removing a favorite cannot break message history.
+export const stickerAssets = sqliteTable('sticker_assets', {
+  id: text('id').primaryKey(),
+  createdAt: integer('created_at').notNull(),
+});
+
+export const personalStickers = sqliteTable('personal_stickers', {
+  userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  stickerId: text('sticker_id').notNull().references(() => stickerAssets.id),
+  name: text('name').notNull(),
+  createdAt: integer('created_at').notNull(),
+}, (table) => ({ pk: primaryKey({ columns: [table.userId, table.stickerId] }) }));

@@ -1,0 +1,1 @@
+ALTER TABLE `instance_settings` ADD `main_space_id` text;
