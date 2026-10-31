@@ -1,0 +1,76 @@
+# Patogh — nginx reverse proxy (replaces the bundled Caddy).
+# The nginx image renders this with envsubst at start: only ${DOMAIN} is an env
+# var; nginx's own $variables pass through untouched.
+#
+# Certificates are NOT issued automatically (Caddy did that). First issuance,
+# before `docker compose up` while port 80 is free:
+#   certbot certonly --standalone -d <DOMAIN>
+# Renewal while nginx runs (webroot below), then `docker compose exec nginx nginx -s reload`:
+#   certbot renew --webroot -w ./certbot-www
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 80 default_server;
+    server_name ${DOMAIN};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$http_host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl default_server;
+    http2 on;
+    server_name ${DOMAIN};
+
+    ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+
+    # Header ownership (see docs/systems/web-security.md): the proxy owns HSTS
+    # because only the TLS terminator knows HTTPS is in play; the app owns
+    # everything else, CSP included. Do not add a CSP here.
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    # No cap, as with Caddy: the app enforces MAX_UPLOAD_SIZE itself. Streaming
+    # the body through keeps large uploads off nginx's temp disk.
+    client_max_body_size 0;
+    proxy_request_buffering off;
+
+    # LiveKit signaling: trailing slash on proxy_pass strips the /livekit prefix.
+    location /livekit/ {
+        proxy_pass http://host.docker.internal:7880/;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $http_host;
+        proxy_set_header Upgrade           $http_upgrade;
+        proxy_set_header Connection        $connection_upgrade;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    # API, WebSocket, and frontend. Docker DNS resolves "patogh".
+    location / {
+        proxy_pass http://patogh:3000;
+        proxy_http_version 1.1;
+        # $http_host, not $host: $host drops a non-443 port.
+        proxy_set_header Host              $http_host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        # Appends, so TRUSTED_PROXY_HOPS=1 picks nginx's view of the client.
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $http_host;
+        proxy_set_header Upgrade           $http_upgrade;
+        proxy_set_header Connection        $connection_upgrade;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}
