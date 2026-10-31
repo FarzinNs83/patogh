@@ -113,16 +113,24 @@ if ! command -v docker &>/dev/null; then
   # Docker's own script first. Its download servers refuse Iranian IPs, so on
   # failure fall back to the distribution's packages, which come from the
   # server's own (usually local) apt mirror.
+  # A fresh server runs unattended-upgrades right after boot and holds the dpkg
+  # lock for minutes. Wait for it here (an empty install only takes the lock):
+  # Docker's script calls apt-get without a lock timeout and would just fail.
+  APT=(apt-get -o DPkg::Lock::Timeout=600)
+  if command -v apt-get &>/dev/null; then
+    info "Waiting for other apt runs (unattended-upgrades) to finish..."
+    $SUDO "${APT[@]}" install -y -qq >/dev/null || true
+  fi
   if ! { curl -fsSL --max-time 30 https://get.docker.com -o /tmp/get-docker.sh && $SUDO sh /tmp/get-docker.sh; }; then
     warn "Docker's install script is unreachable or failed -- using the distribution's packages."
     if ! command -v apt-get &>/dev/null; then
       error "Could not install Docker automatically. Install Docker Engine with the Compose plugin and re-run."
       exit 1
     fi
-    $SUDO apt-get update
-    $SUDO apt-get install -y docker.io
+    $SUDO "${APT[@]}" update
+    $SUDO "${APT[@]}" install -y docker.io
     # The Compose v2 plugin has a different name per distribution release.
-    $SUDO apt-get install -y docker-compose-v2 || $SUDO apt-get install -y docker-compose-plugin || true
+    $SUDO "${APT[@]}" install -y docker-compose-v2 || $SUDO "${APT[@]}" install -y docker-compose-plugin || true
   fi
   rm -f /tmp/get-docker.sh
   $SUDO systemctl enable --now docker 2>/dev/null || true
