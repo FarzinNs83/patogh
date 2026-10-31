@@ -32,9 +32,14 @@ COPY packages/web/package.json packages/web/
 # NPM_REGISTRY: a mirror for networks where registry.npmjs.org is blocked
 # (install.sh picks one that answers). npm swaps the lockfile's registry host
 # for it, so the pinned versions and integrity hashes still apply.
+# --ignore-scripts: npm still runs an implicit `node-gyp rebuild` for
+# better-sqlite3 because it ships a binding.gyp, despite "gypfile": false, and
+# that fails here without Python and a compiler. Its prebuilt binary is loaded
+# from prebuilds/ anyway, and esbuild (for tsx) finds its binary without its
+# install script.
 ARG NPM_REGISTRY=""
 RUN if [ -n "$NPM_REGISTRY" ]; then npm config set registry "$NPM_REGISTRY"; fi && \
-    npm ci --omit=dev -w @patogh/server && mkdir -p packages/server/node_modules
+    npm ci --omit=dev --ignore-scripts -w @patogh/server && mkdir -p packages/server/node_modules
 
 # ============================================================
 # Stage 2: Build the frontend
