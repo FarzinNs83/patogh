@@ -389,6 +389,14 @@ EOF
     exit 1
   fi
   say "DNS OK: ${DOMAIN} -> ${PUBLIC_IPV4}"
+
+  # Let's Encrypt prefers IPv6: an AAAA record elsewhere fails the challenge.
+  # (ahostsv6 maps a plain A record to ::ffff:a.b.c.d; that is not an AAAA.)
+  local v6
+  v6=$(getent ahostsv6 "$DOMAIN" 2> /dev/null | awk '$1 !~ /^::ffff:/ {print $1; exit}') || v6=""
+  if [[ -n $v6 ]] && ! ip -6 addr show scope global 2> /dev/null | grep -qiF "inet6 ${v6}/"; then
+    die "${DOMAIN} also has an AAAA (IPv6) record, ${v6}, that is not this server. Let's Encrypt checks IPv6 first, so the certificate would fail. Delete the AAAA record (or point it here) and re-run."
+  fi
 }
 
 relay_active() {
@@ -967,13 +975,61 @@ obtain_certificate() {
   fi
   [[ $STAGING -eq 1 ]] && args+=(--staging)
 
+  acme_selftest
   say "Requesting a Let's Encrypt certificate for ${DOMAIN} (HTTP-01, webroot) ..."
-  if ! certbot "${args[@]}"; then
-    warn "certbot failed. Common causes: DNS not pointing here, TCP/80 closed in the provider firewall, Cloudflare proxy on."
+  local out i
+  out=$(mktemp)
+  for i in 1 2 3 4 5 6; do
+    certbot "${args[@]}" 2>&1 | tee "$out" && break
+    # certbot.timer (or an older certbot container) may be renewing right now
+    if grep -q 'Another instance of Certbot is already running' "$out" && ((i < 6)); then
+      say "Another certbot is running; waiting 20 s ..."
+      sleep 20
+      continue
+    fi
+    rm -f "$out"
+    warn "certbot failed (its reason is above). This server answers the challenge itself (checked), so"
+    warn "Let's Encrypt cannot reach it: TCP/80 closed in the provider firewall, DNS (A / AAAA) not pointing"
+    warn "here, or the Cloudflare proxy on. Details: /var/log/letsencrypt/letsencrypt.log"
     return 1
-  fi
+  done
+  rm -f "$out"
   cert_valid || die "certbot reported success but the certificate in ${TLS_DIR}/${DOMAIN} is not usable."
   say "Certificate issued."
+}
+
+# Serves a test file the way Let's Encrypt will fetch it, through whatever
+# holds :80 here. Catches a port 80 taken by something other than this nginx
+# before certbot burns an attempt (Let's Encrypt limits failed validations).
+acme_selftest() {
+  local tok body holder
+  tok="patogh-selftest-$(openssl rand -hex 8)"
+  printf '%s\n' "$tok" > "${ACME_ROOT}/.well-known/acme-challenge/${tok}"
+  body=$(curl -s --max-time 10 --resolve "${DOMAIN}:80:127.0.0.1" "http://${DOMAIN}/.well-known/acme-challenge/${tok}" 2> /dev/null) || body=""
+  rm -f "${ACME_ROOT}/.well-known/acme-challenge/${tok}"
+  [[ $body == "$tok" ]] && return 0
+  holder=$(port_holder 80) || true
+  die "Port 80 on this server does not serve the certificate challenge (held by: ${holder:-nothing}). Free TCP/80 for nginx and re-run."
+}
+
+# Containers left on 80/443 by an earlier install.sh run: its certbot (run
+# with -p 80:80) and its bundled nginx. They would take the certificate
+# challenge away from the host nginx.
+free_ports_from_old_install() {
+  local name image p wd
+  command -v docker > /dev/null 2>&1 || return 0
+  for p in 80 443; do
+    while read -r name image; do
+      [[ -n $name ]] || continue
+      wd=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$name" 2> /dev/null) || wd=""
+      # only Patogh's own: never someone else's nginx
+      if [[ $image == certbot/* || ($name == nginx && -n $wd && -f ${wd}/docker-compose.proxy.yml) ]] \
+        && { [[ $image == certbot/* ]] || grep -qs 'container_name: patogh' "${wd}/docker-compose.yml"; }; then
+        say "Removing the container ${name} (${image}) left on TCP/${p} by an earlier install ..."
+        docker rm -f "$name" > /dev/null
+      fi
+    done < <(docker ps --filter "publish=${p}" --format '{{.Names}} {{.Image}}' 2> /dev/null)
+  done
 }
 
 install_renew_hook() {
@@ -1198,6 +1254,7 @@ install_all() {
   precheck_dns
   precheck_domain_free
   precheck_old_install
+  free_ports_from_old_install
   precheck_ports
   ensure_swap
 
