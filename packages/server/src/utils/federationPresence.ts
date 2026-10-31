@@ -1,0 +1,258 @@
+import { and, eq, inArray, isNull, or } from 'drizzle-orm';
+import type { Activity, FederationRelayEvent, FederationPresenceUpdatePayload, ReplicatedInstance } from '@patogh/shared';
+import { getDb, schema } from '../db/index.js';
+import { getOurOrigin } from './federationAuth.js';
+import { getFriendEventTargets, isFederationRelayEnabled, queueOutboxEvent } from './federationOutbox.js';
+import { presenceUpdateEvent } from '../ws/presenceEvent.js';
+import { collectProfileBroadcastTargetIds } from './userDeletion.js';
+import { extractDomain } from '../routes/federation.js';
+import { projectReplicaStatus } from '../ws/replicaPresence.js';
+
+export type PresenceStatus = 'online' | 'idle' | 'dnd' | 'offline';
+
+/**
+ * Queue a presence_update event for the given native user. Broadcast like
+ * profile_update: to active and unreachable peers, not pending ones (see
+ * `queueOutboxEvent`). Outbox-only — presence is ephemeral;
+ * stale replays from a mutation log are wrong, so we never call
+ * appendMutationLog. The peer-activation hook re-emits a fresh snapshot for
+ * peer-related online natives, so a peer recovering from unreachable converges
+ * without history replay.
+ *
+ * No-op for replicated users (their home instance owns presence projection).
+ * A detached account is homed here (`rehomeDetachedAccount` cleared its home
+ * pair), so it relays like any native user, under its identity here: its
+ * local id at this instance's origin, the identity peers know it by (#310).
+ */
+export function queuePresenceRelay(
+  userId: string,
+  status: PresenceStatus,
+  activities: Activity[],
+): void {
+  if (!isFederationRelayEnabled()) return;
+
+  const db = getDb();
+  const user = db.select().from(schema.users).where(eq(schema.users.id, userId)).get();
+  if (!user) return;
+  if (user.homeInstance) return; // replicated — its home is the authority
+
+  // targetPeerOrigins = undefined → broadcast (see `queueOutboxEvent`).
+  queuePresenceEvent(user.id, status, activities, undefined, '');
+}
+
+/**
+ * Queue one presence_update about native `userId`, always with the full
+ * `activities` list (`[]` for none). Receivers read `[]` as "none" and an
+ * absent field as "unchanged", which is what a status-only relay from a peer
+ * that predates this rule means.
+ *
+ * entityId = userId. The outbox queue is `presence:<userId>`, apart from the
+ * user's profile queue; a newer status replaces a queued one
+ * (federationOutboxQueue.ts).
+ * contextId = userId, contextType = 'profile' (reuses existing routing).
+ * NO appendMutationLog — presence must not be replayed from history.
+ */
+function queuePresenceEvent(
+  userId: string,
+  status: PresenceStatus,
+  activities: Activity[],
+  targetPeerOrigins: string[] | undefined,
+  messageIdSuffix: string,
+): void {
+  const ts = Date.now();
+  const payload: FederationPresenceUpdatePayload = {
+    homeUserId: userId,
+    homeInstance: getOurOrigin(),
+    status,
+    ts,
+    activities,
+  };
+
+  const event: FederationRelayEvent = {
+    eventType: 'presence_update',
+    contextType: 'profile',
+    messageId: `presence:${userId}:${ts}${messageIdSuffix}`,
+    encryptionVersion: 0,
+    timestamp: ts,
+    presenceUpdate: payload,
+  };
+
+  queueOutboxEvent(userId, userId, 'presence_update', JSON.stringify(event), targetPeerOrigins, 'profile');
+}
+
+/**
+ * A friendship between native `nativeUserId` and `friendUserId` was just
+ * created. If the friend is replicated, send the native's current presence
+ * (status + `activities`) to the friend's home, which keeps it on its row for
+ * the native and tells the friend. Presence relays fire only on change, so an
+ * activity that began before the friend's home had a row for the native was
+ * dropped there (#340).
+ *
+ * No-op when the native is itself replicated (its home owns the projection),
+ * when the friend is local, or when the native is offline (the friendship
+ * payload's profile snapshot already carries that).
+ */
+export function snapshotPresenceForFriend(nativeUserId: string, friendUserId: string, activities: Activity[]): void {
+  if (!isFederationRelayEnabled()) return;
+
+  const db = getDb();
+  const native = db.select().from(schema.users).where(eq(schema.users.id, nativeUserId)).get();
+  const friend = db.select().from(schema.users).where(eq(schema.users.id, friendUserId)).get();
+  if (!native || !friend) return;
+  if (native.homeInstance || !friend.homeInstance) return;
+  if (!native.status || native.status === 'offline') return;
+
+  const targets = getFriendEventTargets(null, friend.homeInstance);
+  if (targets.length === 0) return;
+  queuePresenceEvent(native.id, native.status as PresenceStatus, activities, targets, ':friend');
+}
+
+/**
+ * On peer activation, send a fresh presence snapshot (status and current
+ * activities) to the newly-active peer for every online local native user that
+ * has an S2S relationship with that peer (so the peer's stubs reflect current
+ * reality — presence is outbox-only, no mutation-log replay can do this).
+ *
+ * Scope is bounded by relationship count, not native count. A native qualifies
+ * if ANY of:
+ *   - friend with at least one stub whose home_instance = peer domain
+ *   - DM-member (closed=0) with at least one stub whose home_instance = peer domain
+ *   - replicatedInstances JSON includes peerOrigin (explicit client-federation opt-in)
+ *
+ * Re-runs on every activation (including health-check unreachable→active flaps),
+ * because markPeerStubsOffline ran on deactivation — peers and our stubs both
+ * need a fresh handshake on recovery, not a stale-window-skip.
+ */
+export async function snapshotPresenceForPeer(peerOrigin: string): Promise<void> {
+  if (!isFederationRelayEnabled()) return;
+
+  const db = getDb();
+  const peerDomain = extractDomain(peerOrigin);
+
+  // 1. All stubs from this peer that exist locally.
+  const peerStubIdList = db
+    .select({ id: schema.users.id })
+    .from(schema.users)
+    .where(and(
+      eq(schema.users.homeInstance, peerDomain),
+      eq(schema.users.isDeleted, 0),
+    ))
+    .all()
+    .map((s) => s.id);
+  const peerStubIds = new Set(peerStubIdList); // O(1) membership tests in the friend loop
+
+  // 2. Build the set of native IDs related to those stubs (friends + DM co-members).
+  const relatedNativeIds = new Set<string>();
+  if (peerStubIdList.length > 0) {
+    const friendRows = db.select().from(schema.friends)
+      .where(or(
+        inArray(schema.friends.userId, peerStubIdList),
+        inArray(schema.friends.friendId, peerStubIdList),
+      ))
+      .all();
+    for (const f of friendRows) {
+      const stubSide = peerStubIds.has(f.userId) ? f.userId : f.friendId;
+      const otherSide = stubSide === f.userId ? f.friendId : f.userId;
+      relatedNativeIds.add(otherSide);
+    }
+
+    // Stub's DM memberships — filter closed=0 so DMs the stub left don't pull
+    // their old co-members into snapshot scope.
+    const stubDmIds = db.select({ dmChannelId: schema.dmMembers.dmChannelId })
+      .from(schema.dmMembers)
+      .where(and(
+        inArray(schema.dmMembers.userId, peerStubIdList),
+        eq(schema.dmMembers.closed, 0),
+      ))
+      .all()
+      .map((d) => d.dmChannelId);
+    if (stubDmIds.length > 0) {
+      // Co-members — filter closed=0 so a native who closed the DM locally
+      // doesn't receive snapshots for its lingering stub.
+      const dmCoMembers = db.select({ userId: schema.dmMembers.userId })
+        .from(schema.dmMembers)
+        .where(and(
+          inArray(schema.dmMembers.dmChannelId, stubDmIds),
+          eq(schema.dmMembers.closed, 0),
+        ))
+        .all();
+      for (const m of dmCoMembers) relatedNativeIds.add(m.userId);
+    }
+  }
+
+  // 3. Add explicit client-federation opt-ins via replicatedInstances JSON.
+  // (We can't index a JSON string in SQLite, so scan natives once and parse.)
+  // SCALING NOTE: this full-natives scan is fine pre-launch and remains cheap
+  // for instances under ~10k users. If population grows past that, replace with
+  // a `user_replicated_instance_index` table populated when replicatedInstances
+  // is written, indexed on (origin) for direct EXISTS lookup.
+  const allNatives = db.select().from(schema.users)
+    .where(and(
+      isNull(schema.users.homeInstance),
+      eq(schema.users.isDeleted, 0),
+    ))
+    .all();
+  for (const u of allNatives) {
+    if (!u.replicatedInstances) continue;
+    try {
+      const list = JSON.parse(u.replicatedInstances) as ReplicatedInstance[];
+      if (list.some((ri) => ri.origin === peerOrigin)) relatedNativeIds.add(u.id);
+    } catch { /* malformed JSON — skip */ }
+  }
+
+  // 4. Filter to online natives in the related set; emit one outbox event each,
+  // carrying the native's current activities.
+  // Lazy import keeps this module pure for tests that don't need ws/handler.
+  const { connectionManager } = await import('../ws/handler.js');
+  for (const u of allNatives) {
+    if (!relatedNativeIds.has(u.id)) continue;
+    if (!u.status || u.status === 'offline') continue;
+    if (u.homeInstance) continue; // belt-and-braces: must be native
+
+    queuePresenceEvent(u.id, u.status as PresenceStatus, connectionManager.getUserActivities(u.id), [peerOrigin], ':snap');
+  }
+}
+
+/**
+ * On peer deactivation (status flipping out of 'active'), project 'offline' for
+ * every replicated stub whose home is that peer (`projectReplicaStatus`: the
+ * row shows 'offline', or 'online' while the user has a session here, and
+ * returns to 'offline' when that session ends) and broadcast a local
+ * presence_update so connected friends/DM-mates/space-co-members see the
+ * change immediately. Detached rows own their status and are left alone.
+ *
+ * Imported lazily by onPeerDeactivated to avoid an import cycle through
+ * ws/handler.js (connectionManager).
+ *
+ * Accepts an origin string; derives the bare domain via extractDomain so the
+ * caller doesn't need to handle that detail.
+ */
+export async function markPeerStubsOffline(peerOrigin: string): Promise<void> {
+  const peerDomain = extractDomain(peerOrigin);
+  const db = getDb();
+  const stubs = db
+    .select({ id: schema.users.id, homeUserId: schema.users.homeUserId, homeInstance: schema.users.homeInstance })
+    .from(schema.users)
+    .where(and(
+      eq(schema.users.homeInstance, peerDomain),
+      eq(schema.users.isDeleted, 0),
+    ))
+    .all();
+
+  if (stubs.length === 0) return;
+
+  // Lazy import keeps this module pure for tests that don't need ws/handler.
+  const { connectionManager } = await import('../ws/handler.js');
+
+  for (const stub of stubs) {
+    const shown = projectReplicaStatus(stub.id, 'offline');
+    if (shown === null) continue;
+
+    // The activities relayed from the peer are stale once it is unreachable.
+    connectionManager.clearUserActivities(stub.id);
+
+    const targets = collectProfileBroadcastTargetIds(stub.id);
+    const payload = presenceUpdateEvent(stub, shown, []);
+    for (const uid of targets) connectionManager.sendToUser(uid, payload);
+  }
+}

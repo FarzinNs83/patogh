@@ -1,0 +1,833 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import * as schema from '../db/schema.js';
+import { eq } from 'drizzle-orm';
+import { __resetInstanceIdCacheForTest } from './federationEpoch.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+type TestDb = ReturnType<typeof drizzle<typeof schema>>;
+let sqlite: Database.Database;
+let testDb: TestDb;
+
+vi.mock('../db/index.js', () => ({
+  getDb: () => testDb,
+  schema,
+}));
+
+vi.mock('../ws/handler.js', () => ({
+  connectionManager: {
+    sendToAdmins: vi.fn(),
+    getAllOnlineUserIds: () => [],
+    sendToUser: vi.fn(),
+    sendToDmMembers: vi.fn(),
+    evictFederatedCallsForHost: vi.fn().mockReturnValue(0),
+    getAllFederatedCalls: vi.fn(() => new Map()),
+  },
+}));
+
+vi.mock('../utils/federationAuth.js', () => ({
+  getOurOrigin: () => 'https://test.example',
+  buildFederationHeaders: () => ({ 'Content-Type': 'application/json' }),
+  generateHmacSecret: () => 'secret',
+  ROTATION_GRACE_PERIOD_MS: 15 * 60 * 1000,
+}));
+
+vi.mock('../utils/federationOutbox.js', () => ({
+  isFederationRelayEnabled: () => true,
+  queueOutboxEvent: vi.fn(),
+  appendMutationLog: vi.fn(),
+}));
+
+vi.mock('../utils/federationPeerActivation.js', () => ({
+  onPeerActivated: vi.fn(),
+  onPeerDeactivated: vi.fn().mockResolvedValue(undefined),
+  startupBootstrapSync: vi.fn(),
+}));
+
+vi.mock('../utils/storageJanitor.js', () => ({
+  runFederationJanitor: vi.fn(),
+}));
+
+vi.mock('../utils/thumbnail.js', () => ({
+  generateThumbnail: vi.fn(),
+}));
+
+vi.mock('../routes/dm.js', () => ({
+  getDmMessageWithUser: vi.fn(),
+}));
+
+vi.mock('../utils/federationAuthFailure.js', () => ({
+  evaluateAuthFailure: vi.fn().mockReturnValue({ kind: 'increment', newAuthFailures: 1 }),
+  AUTH_FAILURE_THRESHOLD: 5,
+}));
+
+// The real config, except that the retry divisor can be set per test.
+const federationConfig = vi.hoisted(() => ({ backoffDivisor: 1 }));
+vi.mock('../config.js', async (importActual) => {
+  const actual = await importActual<typeof import('../config.js')>();
+  return {
+    config: {
+      ...actual.config,
+      federation: {
+        ...actual.config.federation,
+        get backoffDivisor(): number { return federationConfig.backoffDivisor; },
+      },
+    },
+  };
+});
+
+const invokeRollbackMock = vi.fn();
+vi.mock('./federationRollback.js', () => ({
+  invokePermanentFailureCallback: invokeRollbackMock,
+  registerPermanentFailureCallback: vi.fn(),
+  _resetCallbacks: vi.fn(),
+}));
+
+function applyMigrations(db: Database.Database): void {
+  const migrationsDir = path.resolve(__dirname, '../../drizzle');
+  const files = fs.readdirSync(migrationsDir).filter(f => f.endsWith('.sql')).sort();
+  for (const f of files) {
+    const sql = fs.readFileSync(path.join(migrationsDir, f), 'utf8');
+    const statements = sql.split(/-->\s*statement-breakpoint/);
+    for (const stmt of statements) {
+      const clean = stmt.trim();
+      if (clean) db.exec(clean);
+    }
+  }
+}
+
+/**
+ * Seed this instance's epoch so the outbox relay builder can stamp
+ * `sourceInstanceId` via getInstanceId(). Resets the module cache so the fresh
+ * per-test DB row is read rather than a value cached from a prior test.
+ */
+function seedInstanceEpoch(): void {
+  testDb.insert(schema.instanceSettings).values({
+    id: 1,
+    instanceId: 'worker-test-epoch',
+    updatedAt: Date.now(),
+  } as typeof schema.instanceSettings.$inferInsert).run();
+  __resetInstanceIdCacheForTest();
+}
+
+function seedPeer(id: string): void {
+  testDb.insert(schema.federationPeers).values({
+    id, origin: 'https://peer.example', hmacSecret: 'secret',
+    status: 'active', lastSyncedAt: Date.now(), createdAt: Date.now(),
+  }).run();
+}
+
+function seedOutboxEntry(id: string, peerId: string, entityId: string, eventType = 'create'): void {
+  testDb.insert(schema.federationOutbox).values({
+    id, peerId, contextId: 'ch-1', entityId,
+    contextType: 'dm', eventType, payload: JSON.stringify({
+      message: { userId: 'u', homeUserId: 'u', homeInstance: 'test.example', content: 'hi', replyToId: null, editedAt: null, createdAt: Date.now() },
+    }),
+    encryptionVersion: 0, attempts: 0, nextRetryAt: Date.now() - 1000,
+    expiresAt: Date.now() + 30 * 86_400_000,
+    createdAt: Date.now(),
+  }).run();
+}
+
+describe('outbox worker — duplicate rejection is terminal', () => {
+  beforeEach(() => {
+    sqlite = new Database(':memory:');
+    testDb = drizzle(sqlite, { schema });
+    applyMigrations(sqlite);
+    seedInstanceEpoch();
+    vi.restoreAllMocks();
+    // Re-apply the static mocks that vi.restoreAllMocks() would undo.
+    // isFederationRelayEnabled is mocked at module level via vi.mock (hoisted),
+    // so it survives restoreAllMocks — spies created with vi.spyOn are the ones
+    // that get restored. The fetch spy is re-created per test via mockImplementation.
+  });
+
+  it('deletes the outbox entry when the peer responds with duplicate rejection', async () => {
+    seedPeer('peer-dup');
+    seedOutboxEntry('entry-dup', 'peer-dup', 'msg-already-there');
+
+    // Mock the fetch to return a relay response with duplicate rejection
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(JSON.stringify({
+        accepted: [],
+        rejected: [{ messageId: 'msg-already-there', reason: 'duplicate' }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    const workerModule = await import('./federationWorker.js');
+    const processOutboxTick = (workerModule as { processOutboxTick?: () => Promise<void> }).processOutboxTick;
+    if (!processOutboxTick) {
+      throw new Error('processOutboxTick must be exported for this test. If not yet exported, export it.');
+    }
+    await processOutboxTick();
+
+    // Verify the outbox entry was deleted (terminal treatment)
+    const remaining = testDb.select().from(schema.federationOutbox)
+      .where(eq(schema.federationOutbox.id, 'entry-dup')).get();
+    expect(remaining).toBeUndefined();
+  });
+
+  it('retains outbox entries for non-duplicate rejection reasons (e.g., processing_error)', async () => {
+    seedPeer('peer-transient');
+    seedOutboxEntry('entry-transient', 'peer-transient', 'msg-transient');
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(JSON.stringify({
+        accepted: [],
+        rejected: [{ messageId: 'msg-transient', reason: 'processing_error' }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    const workerModule = await import('./federationWorker.js');
+    const processOutboxTick = (workerModule as { processOutboxTick?: () => Promise<void> }).processOutboxTick;
+    if (!processOutboxTick) {
+      throw new Error('processOutboxTick must be exported for this test.');
+    }
+    await processOutboxTick();
+
+    const remaining = testDb.select().from(schema.federationOutbox)
+      .where(eq(schema.federationOutbox.id, 'entry-transient')).get();
+    // The entry must be retained — a 200 OK with a transient rejection reason
+    // does not delete the outbox entry. (Backoff is only applied on non-OK HTTP
+    // responses; a 200 with a rejection means the peer processed the batch but
+    // declined this particular message — the entry stays for the next tick.)
+    expect(remaining).toBeDefined();
+  });
+});
+
+// ─── Sentinel test helpers ───────────────────────────────────────────────────
+
+function seedSentinelPeer(
+  id: string,
+  origin: string,
+  status: string,
+  instanceName?: string,
+): void {
+  testDb.insert(schema.federationPeers).values({
+    id,
+    origin,
+    hmacSecret: 'secret',
+    status,
+    instanceName: instanceName ?? null,
+    lastSyncedAt: 0,
+    createdAt: Date.now(),
+  }).run();
+}
+
+type FedCallEntry = import('../ws/handler.js').FederatedCallEntry;
+
+function makeFedCall(partial: Partial<FedCallEntry>): FedCallEntry {
+  return {
+    dmChannelId: null,
+    federatedId: `fed-${Math.random().toString(36).slice(2, 8)}`,
+    callerId: 'caller',
+    callerHomeUserId: 'caller-home',
+    federatedCallHost: 'https://hostA.example',
+    livekitUrl: 'wss://lk.example',
+    tokens: new Map(),
+    ringedUserIds: [],
+    joinedUserIds: [],
+    group: false,
+    state: 'active',
+    startedAt: Date.now(),
+    ...partial,
+  };
+}
+
+// ─── Sentinel describe block ─────────────────────────────────────────────────
+
+describe('federatedCallSentinel', () => {
+  beforeEach(() => {
+    sqlite = new Database(':memory:');
+    testDb = drizzle(sqlite, { schema });
+    applyMigrations(sqlite);
+  });
+
+  afterEach(() => {
+    sqlite.close();
+  });
+
+  it('early-exits when there are no federated calls (no DB work, no eviction calls)', async () => {
+    const { connectionManager } = await import('../ws/handler.js');
+    vi.mocked(connectionManager.getAllFederatedCalls).mockReturnValue(new Map());
+    vi.mocked(connectionManager.evictFederatedCallsForHost).mockClear();
+
+    const { runFederatedCallSentinelTick } = await import('./federationWorker.js');
+    await runFederatedCallSentinelTick();
+
+    expect(connectionManager.evictFederatedCallsForHost).not.toHaveBeenCalled();
+  });
+
+  it('evicts entries whose host peer is non-active', async () => {
+    seedSentinelPeer('p-A', 'https://hostA.example', 'unreachable', 'HostA');
+    seedSentinelPeer('p-B', 'https://hostB.example', 'active', 'HostB');
+
+    const calls = new Map<string, FedCallEntry>([
+      ['fed-1', makeFedCall({ federatedId: 'fed-1', federatedCallHost: 'https://hostA.example' })],
+      ['fed-2', makeFedCall({ federatedId: 'fed-2', federatedCallHost: 'https://hostB.example' })],
+    ]);
+
+    const { connectionManager } = await import('../ws/handler.js');
+    vi.mocked(connectionManager.getAllFederatedCalls).mockReturnValue(calls);
+    vi.mocked(connectionManager.evictFederatedCallsForHost).mockClear();
+
+    const { runFederatedCallSentinelTick } = await import('./federationWorker.js');
+    await runFederatedCallSentinelTick();
+
+    expect(connectionManager.evictFederatedCallsForHost).toHaveBeenCalledTimes(1);
+    expect(connectionManager.evictFederatedCallsForHost).toHaveBeenCalledWith(
+      'https://hostA.example',
+      { reason: 'peer_transient_failure', peerLabel: 'HostA' },
+    );
+  });
+
+  it('maps rejected/revoked to peer_rejected', async () => {
+    seedSentinelPeer('p-rej', 'https://hostRej.example', 'rejected', 'Rej');
+    seedSentinelPeer('p-rev', 'https://hostRev.example', 'revoked', 'Rev');
+
+    const calls = new Map<string, FedCallEntry>([
+      ['fed-rej', makeFedCall({ federatedId: 'fed-rej', federatedCallHost: 'https://hostRej.example' })],
+      ['fed-rev', makeFedCall({ federatedId: 'fed-rev', federatedCallHost: 'https://hostRev.example' })],
+    ]);
+
+    const { connectionManager } = await import('../ws/handler.js');
+    vi.mocked(connectionManager.getAllFederatedCalls).mockReturnValue(calls);
+    vi.mocked(connectionManager.evictFederatedCallsForHost).mockClear();
+
+    const { runFederatedCallSentinelTick } = await import('./federationWorker.js');
+    await runFederatedCallSentinelTick();
+
+    expect(connectionManager.evictFederatedCallsForHost).toHaveBeenCalledWith(
+      'https://hostRej.example',
+      { reason: 'peer_rejected', peerLabel: 'Rej' },
+    );
+    expect(connectionManager.evictFederatedCallsForHost).toHaveBeenCalledWith(
+      'https://hostRev.example',
+      { reason: 'peer_rejected', peerLabel: 'Rev' },
+    );
+  });
+
+  it('treats a missing peer row as transient failure', async () => {
+    const calls = new Map<string, FedCallEntry>([
+      ['fed-missing', makeFedCall({ federatedId: 'fed-missing', federatedCallHost: 'https://ghost.example' })],
+    ]);
+    const { connectionManager } = await import('../ws/handler.js');
+    vi.mocked(connectionManager.getAllFederatedCalls).mockReturnValue(calls);
+    vi.mocked(connectionManager.evictFederatedCallsForHost).mockClear();
+
+    const { runFederatedCallSentinelTick } = await import('./federationWorker.js');
+    await runFederatedCallSentinelTick();
+
+    expect(connectionManager.evictFederatedCallsForHost).toHaveBeenCalledWith(
+      'https://ghost.example',
+      { reason: 'peer_transient_failure', peerLabel: undefined },
+    );
+  });
+});
+
+// ─── Terminal rejection reasons + rollback invocation ────────────────────────
+
+describe('outbox worker — terminal rejection reasons + rollback invocation', () => {
+  beforeEach(() => {
+    sqlite = new Database(':memory:');
+    testDb = drizzle(sqlite, { schema });
+    applyMigrations(sqlite);
+    seedInstanceEpoch();
+    vi.restoreAllMocks();
+    invokeRollbackMock.mockReset();
+  });
+
+  afterEach(() => {
+    sqlite.close();
+  });
+
+  it('recipient_not_found for friend_request_create is terminal AND invokes rollback', async () => {
+    seedPeer('peer-r1');
+    seedOutboxEntry('entry-r1', 'peer-r1', 'msg-1', 'friend_request_create');
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(JSON.stringify({
+        accepted: [],
+        rejected: [{ messageId: 'msg-1', reason: 'recipient_not_found' }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    const workerModule = await import('./federationWorker.js');
+    const processOutboxTick = (workerModule as { processOutboxTick?: () => Promise<void> }).processOutboxTick!;
+    await processOutboxTick();
+
+    const remaining = testDb.select().from(schema.federationOutbox)
+      .where(eq(schema.federationOutbox.id, 'entry-r1')).get();
+    expect(remaining).toBeUndefined();
+
+    expect(invokeRollbackMock).toHaveBeenCalledTimes(1);
+    expect(invokeRollbackMock).toHaveBeenCalledWith('friend_request_create', 'msg-1', 'recipient_not_found');
+  });
+
+  it('recipient_not_found for dm_message_create: row deleted, rollback still invoked (no-op inside registry)', async () => {
+    seedPeer('peer-r2');
+    seedOutboxEntry('entry-r2', 'peer-r2', 'msg-2', 'dm_message_create');
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(JSON.stringify({
+        accepted: [],
+        rejected: [{ messageId: 'msg-2', reason: 'recipient_not_found' }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    const workerModule = await import('./federationWorker.js');
+    const processOutboxTick = (workerModule as { processOutboxTick?: () => Promise<void> }).processOutboxTick!;
+    await processOutboxTick();
+
+    const remaining = testDb.select().from(schema.federationOutbox)
+      .where(eq(schema.federationOutbox.id, 'entry-r2')).get();
+    expect(remaining).toBeUndefined();
+
+    // Worker always calls invoke; whether a callback is registered is the registry's concern
+    expect(invokeRollbackMock).toHaveBeenCalledTimes(1);
+    expect(invokeRollbackMock).toHaveBeenCalledWith('dm_message_create', 'msg-2', 'recipient_not_found');
+  });
+
+  it('duplicate rejection is terminal but does NOT invoke rollback callback', async () => {
+    seedPeer('peer-r3');
+    seedOutboxEntry('entry-r3', 'peer-r3', 'msg-3', 'friend_request_create');
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(JSON.stringify({
+        accepted: [],
+        rejected: [{ messageId: 'msg-3', reason: 'duplicate' }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    const workerModule = await import('./federationWorker.js');
+    const processOutboxTick = (workerModule as { processOutboxTick?: () => Promise<void> }).processOutboxTick!;
+    await processOutboxTick();
+
+    const remaining = testDb.select().from(schema.federationOutbox)
+      .where(eq(schema.federationOutbox.id, 'entry-r3')).get();
+    expect(remaining).toBeUndefined();
+
+    expect(invokeRollbackMock).not.toHaveBeenCalled();
+  });
+
+  it('attribution_mismatch is terminal AND invokes rollback', async () => {
+    seedPeer('peer-r4');
+    seedOutboxEntry('entry-r4', 'peer-r4', 'msg-4', 'friend_request_create');
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(JSON.stringify({
+        accepted: [],
+        rejected: [{ messageId: 'msg-4', reason: 'attribution_mismatch' }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    const workerModule = await import('./federationWorker.js');
+    const processOutboxTick = (workerModule as { processOutboxTick?: () => Promise<void> }).processOutboxTick!;
+    await processOutboxTick();
+
+    const remaining = testDb.select().from(schema.federationOutbox)
+      .where(eq(schema.federationOutbox.id, 'entry-r4')).get();
+    expect(remaining).toBeUndefined();
+
+    expect(invokeRollbackMock).toHaveBeenCalledTimes(1);
+    expect(invokeRollbackMock).toHaveBeenCalledWith('friend_request_create', 'msg-4', 'attribution_mismatch');
+  });
+
+  it('non-terminal rejection (processing_error) does NOT invoke rollback and retains the outbox row', async () => {
+    seedPeer('peer-r5');
+    seedOutboxEntry('entry-r5', 'peer-r5', 'msg-5', 'friend_request_create');
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(JSON.stringify({
+        accepted: [],
+        rejected: [{ messageId: 'msg-5', reason: 'processing_error' }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    const workerModule = await import('./federationWorker.js');
+    const processOutboxTick = (workerModule as { processOutboxTick?: () => Promise<void> }).processOutboxTick!;
+    await processOutboxTick();
+
+    const remaining = testDb.select().from(schema.federationOutbox)
+      .where(eq(schema.federationOutbox.id, 'entry-r5')).get();
+    expect(remaining).toBeDefined();
+
+    expect(invokeRollbackMock).not.toHaveBeenCalled();
+  });
+
+  it('attribution_unproven is retryable: row kept, no rollback, next attempt on the backoff schedule', async () => {
+    seedPeer('peer-r6');
+    seedOutboxEntry('entry-r6', 'peer-r6', 'msg-6', 'create');
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(JSON.stringify({
+        accepted: [],
+        rejected: [{ messageId: 'msg-6', reason: 'attribution_unproven' }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    const before = Date.now();
+    const { processOutboxTick } = await import('./federationWorker.js');
+    await processOutboxTick();
+
+    const remaining = testDb.select().from(schema.federationOutbox)
+      .where(eq(schema.federationOutbox.id, 'entry-r6')).get();
+    expect(remaining).toBeDefined();
+    expect(remaining!.attempts).toBe(1);
+    // First step of BACKOFF_SCHEDULE_MS is 30s.
+    expect(remaining!.nextRetryAt).toBeGreaterThanOrEqual(before + 30_000);
+    expect(invokeRollbackMock).not.toHaveBeenCalled();
+  });
+
+  it('a non-terminal rejection is not re-sent on the next tick, it waits out its backoff', async () => {
+    seedPeer('peer-r7');
+    seedOutboxEntry('entry-r7', 'peer-r7', 'msg-7', 'create');
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(JSON.stringify({
+        accepted: [],
+        rejected: [{ messageId: 'msg-7', reason: 'channel_not_found' }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    const { processOutboxTick } = await import('./federationWorker.js');
+    await processOutboxTick();
+    await processOutboxTick();
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const remaining = testDb.select().from(schema.federationOutbox)
+      .where(eq(schema.federationOutbox.id, 'entry-r7')).get();
+    expect(remaining?.attempts).toBe(1);
+  });
+
+  it('an accepted entry beside a retryable one is removed, and only the retryable one is backed off', async () => {
+    seedPeer('peer-r8');
+    seedOutboxEntry('entry-r8a', 'peer-r8', 'msg-8a', 'create');
+    seedOutboxEntry('entry-r8b', 'peer-r8', 'msg-8b', 'create');
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(JSON.stringify({
+        accepted: ['msg-8a'],
+        rejected: [{ messageId: 'msg-8b', reason: 'attribution_unproven' }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    const { processOutboxTick } = await import('./federationWorker.js');
+    await processOutboxTick();
+
+    const rows = testDb.select().from(schema.federationOutbox).all();
+    expect(rows.map(r => r.id)).toEqual(['entry-r8b']);
+    expect(rows[0]!.attempts).toBe(1);
+  });
+
+  it('tells the receiver it retries attribution_unproven', async () => {
+    seedPeer('peer-r9');
+    seedOutboxEntry('entry-r9', 'peer-r9', 'msg-9', 'create');
+
+    let sentBody: unknown = null;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      sentBody = JSON.parse(String((init as RequestInit).body));
+      return new Response(JSON.stringify({ accepted: ['msg-9'], rejected: [] }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      });
+    });
+
+    const { processOutboxTick } = await import('./federationWorker.js');
+    await processOutboxTick();
+
+    expect(sentBody).toMatchObject({ capabilities: ['attribution_unproven'] });
+  });
+
+  it('sends the target of an edit or delete, and treats not_message_author as terminal', async () => {
+    seedPeer('peer-r11');
+    const target = {
+      message: { messageId: 'orig-11', messageHomeInstance: 'https://peer.example' },
+      federatedId: 'fid-11',
+      actor: { homeUserId: 'u', homeInstance: 'https://test.example' },
+    };
+    testDb.insert(schema.federationOutbox).values({
+      id: 'entry-r11', peerId: 'peer-r11', contextId: 'ch-1', entityId: 'local-11',
+      contextType: 'dm', eventType: 'delete', payload: JSON.stringify({ deleted: true, target }),
+      encryptionVersion: 0, attempts: 0, nextRetryAt: Date.now() - 1000,
+      expiresAt: Date.now() + 30 * 86_400_000, createdAt: Date.now(),
+    }).run();
+
+    let sentBody = '';
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      sentBody = String(init?.body ?? '');
+      return new Response(JSON.stringify({
+        accepted: [],
+        rejected: [{ messageId: 'local-11', reason: 'not_message_author' }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    });
+
+    const { processOutboxTick } = await import('./federationWorker.js');
+    await processOutboxTick();
+
+    const sent = JSON.parse(sentBody) as { events: Array<{ messageId: string; target?: unknown }> };
+    expect(sent.events.find(e => e.messageId === 'local-11')?.target).toEqual(target);
+    const remaining = testDb.select().from(schema.federationOutbox)
+      .where(eq(schema.federationOutbox.id, 'entry-r11')).get();
+    expect(remaining).toBeUndefined();
+  });
+
+  it('an unknown_message rejection is backed off and leaves the peer healthy (#295)', async () => {
+    seedPeer('peer-r10');
+    seedOutboxEntry('entry-r10', 'peer-r10', 'reaction-10', 'reaction_add');
+    seedOutboxEntry('entry-r10b', 'peer-r10', 'msg-10b', 'create');
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(JSON.stringify({
+        accepted: ['msg-10b'],
+        rejected: [{ messageId: 'reaction-10', reason: 'unknown_message' }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    const { processOutboxTick } = await import('./federationWorker.js');
+    const before = Date.now();
+    await processOutboxTick();
+
+    const retained = testDb.select().from(schema.federationOutbox)
+      .where(eq(schema.federationOutbox.id, 'entry-r10')).get()!;
+    expect(retained.attempts).toBe(1);
+    expect(retained.nextRetryAt).toBeGreaterThanOrEqual(before + 30_000);
+
+    // The peer answered the request, so the peer itself is healthy.
+    const peer = testDb.select().from(schema.federationPeers)
+      .where(eq(schema.federationPeers.id, 'peer-r10')).get()!;
+    expect(peer.consecutiveFailures).toBe(0);
+
+    fetchSpy.mockClear();
+    await processOutboxTick();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('unreachable transition resets probe pacing', () => {
+  beforeEach(() => {
+    sqlite = new Database(':memory:');
+    testDb = drizzle(sqlite, { schema });
+    applyMigrations(sqlite);
+    seedInstanceEpoch();
+    vi.restoreAllMocks();
+  });
+
+  it('crossing the threshold sets status=unreachable and resets pacing', async () => {
+    testDb.insert(schema.federationPeers).values({
+      id: 'peer-thr', origin: 'https://peer.example', hmacSecret: 'secret',
+      status: 'active', consecutiveFailures: 9, probeAttempts: 4, lastProbeAt: 123,
+      lastSyncedAt: Date.now(), createdAt: Date.now(),
+    }).run();
+    seedOutboxEntry('e-thr', 'peer-thr', 'm-thr');
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('down'));
+
+    const { processOutboxTick } = await import('./federationWorker.js');
+    await processOutboxTick();
+
+    const row = testDb.select().from(schema.federationPeers)
+      .where(eq(schema.federationPeers.id, 'peer-thr')).get()!;
+    expect(row.status).toBe('unreachable');
+    expect(row.consecutiveFailures).toBe(10);
+    expect(row.probeAttempts).toBe(0);
+    expect(row.lastProbeAt).toBeNull();
+  });
+});
+
+describe('processRecoveryTick — demand-driven recovery', () => {
+  beforeEach(() => {
+    sqlite = new Database(':memory:');
+    testDb = drizzle(sqlite, { schema });
+    applyMigrations(sqlite);
+    vi.restoreAllMocks();
+  });
+
+  function seedUnreachable(id: string, attempts = 0, lastProbeAt: number | null = null): void {
+    testDb.insert(schema.federationPeers).values({
+      id, origin: 'https://peer.example', hmacSecret: 'secret',
+      status: 'unreachable', consecutiveFailures: 10,
+      probeAttempts: attempts, lastProbeAt,
+      lastSyncedAt: Date.now(), createdAt: Date.now(),
+    }).run();
+  }
+
+  it('recovers a peer with queued mail when the probe succeeds', async () => {
+    seedUnreachable('peer-a');                 // lastProbeAt=null → immediately due
+    seedOutboxEntry('e-a', 'peer-a', 'm-a');   // has pending mail
+    const spy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}', { status: 200 }));
+
+    const { processRecoveryTick } = await import('./federationWorker.js');
+    await processRecoveryTick();
+
+    expect(spy).toHaveBeenCalledWith('https://peer.example/api/instance/info', expect.anything());
+    const row = testDb.select().from(schema.federationPeers)
+      .where(eq(schema.federationPeers.id, 'peer-a')).get()!;
+    expect(row.status).toBe('active');
+  });
+
+  it('advances backoff when the probe fails', async () => {
+    seedUnreachable('peer-b');
+    seedOutboxEntry('e-b', 'peer-b', 'm-b');
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('', { status: 502 }));
+
+    const { processRecoveryTick } = await import('./federationWorker.js');
+    await processRecoveryTick();
+
+    const row = testDb.select().from(schema.federationPeers)
+      .where(eq(schema.federationPeers.id, 'peer-b')).get()!;
+    expect(row.status).toBe('unreachable');
+    expect(row.probeAttempts).toBe(1);
+    expect(row.lastProbeAt).toBeGreaterThan(0);
+  });
+
+  it('re-probes 30 s after the first failed probe, the first step of RECOVERY_BACKOFF_MS (#322)', async () => {
+    seedUnreachable('peer-first-step');
+    seedOutboxEntry('e-first-step', 'peer-first-step', 'm-first-step');
+    const spy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('', { status: 502 }));
+
+    const { processRecoveryTick } = await import('./federationWorker.js');
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const t0 = Date.now();
+      await processRecoveryTick();
+      expect(spy).toHaveBeenCalledTimes(1);
+
+      vi.setSystemTime(t0 + 30_000);
+      await processRecoveryTick();
+      expect(spy).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does NOT probe a silent peer before the 15-min backstop is due', async () => {
+    seedUnreachable('peer-c', 1, Date.now() - 60_000); // no outbox entry, probed 1m ago
+    const spy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}', { status: 200 }));
+
+    const { processRecoveryTick } = await import('./federationWorker.js');
+    await processRecoveryTick();
+
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('does NOT probe a pending peer before its backoff interval elapses', async () => {
+    seedUnreachable('peer-d', 0, Date.now() - 5_000); // BACKOFF[0]=30s, probed 5s ago
+    seedOutboxEntry('e-d', 'peer-d', 'm-d');
+    const spy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}', { status: 200 }));
+
+    const { processRecoveryTick } = await import('./federationWorker.js');
+    await processRecoveryTick();
+
+    expect(spy).not.toHaveBeenCalled();
+  });
+});
+
+describe('retry waits follow config.federation.backoffDivisor (#367)', () => {
+  beforeEach(() => {
+    sqlite = new Database(':memory:');
+    testDb = drizzle(sqlite, { schema });
+    applyMigrations(sqlite);
+    seedInstanceEpoch();
+    vi.restoreAllMocks();
+  });
+
+  afterEach(() => {
+    federationConfig.backoffDivisor = 1;
+    sqlite.close();
+  });
+
+  async function firstRetryWait(divisor: number): Promise<number> {
+    federationConfig.backoffDivisor = divisor;
+    seedPeer('peer-div');
+    seedOutboxEntry('e-div', 'peer-div', 'm-div');
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('', { status: 503 }));
+
+    const { processOutboxTick } = await import('./federationWorker.js');
+    const before = Date.now();
+    await processOutboxTick();
+    const row = testDb.select().from(schema.federationOutbox)
+      .where(eq(schema.federationOutbox.id, 'e-div')).get()!;
+    return row.nextRetryAt - before;
+  }
+
+  it('waits the production 30 s after a first failure by default', async () => {
+    const wait = await firstRetryWait(1);
+    expect(wait).toBeGreaterThanOrEqual(30_000);
+    expect(wait).toBeLessThan(31_000);
+  });
+
+  it('divides that wait, as the test harness sets it', async () => {
+    const wait = await firstRetryWait(30);
+    expect(wait).toBeGreaterThanOrEqual(1_000);
+    expect(wait).toBeLessThan(2_000);
+  });
+
+  it("divides the pacing of an unreachable peer's recovery probe too", async () => {
+    federationConfig.backoffDivisor = 30;
+    testDb.insert(schema.federationPeers).values({
+      id: 'peer-rec', origin: 'https://peer.example', hmacSecret: 'secret',
+      status: 'unreachable', consecutiveFailures: 10, probeAttempts: 0, lastProbeAt: Date.now() - 5_000,
+      lastSyncedAt: Date.now(), createdAt: Date.now(),
+    }).run();
+    seedOutboxEntry('e-rec', 'peer-rec', 'm-rec');
+    // Probed 5 s ago: not due on the production 30 s pacing, due on 30 s / 30.
+    const spy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}', { status: 200 }));
+
+    const { processRecoveryTick } = await import('./federationWorker.js');
+    await processRecoveryTick();
+
+    expect(spy).toHaveBeenCalledWith('https://peer.example/api/instance/info', expect.anything());
+  });
+});
+
+describe('auth-failure threshold (#324)', () => {
+  beforeEach(() => {
+    sqlite = new Database(':memory:');
+    testDb = drizzle(sqlite, { schema });
+    applyMigrations(sqlite);
+    seedInstanceEpoch();
+    vi.restoreAllMocks();
+  });
+
+  afterEach(() => {
+    sqlite.close();
+  });
+
+  it('records auth_failures as the reason when the threshold moves a peer to needs_attention', async () => {
+    seedPeer('peer-auth');
+    seedOutboxEntry('e-auth', 'peer-auth', 'm-auth');
+    const { evaluateAuthFailure } = await import('./federationAuthFailure.js');
+    vi.mocked(evaluateAuthFailure).mockReturnValueOnce({ kind: 'transition_to_needs_attention', newAuthFailures: 5 });
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('', { status: 401 }));
+
+    const { processOutboxTick } = await import('./federationWorker.js');
+    await processOutboxTick();
+
+    const row = testDb.select().from(schema.federationPeers)
+      .where(eq(schema.federationPeers.id, 'peer-auth')).get()!;
+    expect(row.status).toBe('needs_attention');
+    expect(row.statusReason).toBe('auth_failures');
+  });
+
+  it('does not move a peer an admin revoked while the delivery was in flight', async () => {
+    seedPeer('peer-auth-revoked');
+    seedOutboxEntry('e-auth-r', 'peer-auth-revoked', 'm-auth-r');
+    const { evaluateAuthFailure } = await import('./federationAuthFailure.js');
+    vi.mocked(evaluateAuthFailure).mockReturnValueOnce({ kind: 'transition_to_needs_attention', newAuthFailures: 5 });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      testDb.update(schema.federationPeers).set({ status: 'revoked' })
+        .where(eq(schema.federationPeers.id, 'peer-auth-revoked')).run();
+      return new Response('', { status: 401 });
+    });
+
+    const { processOutboxTick } = await import('./federationWorker.js');
+    await processOutboxTick();
+
+    const row = testDb.select().from(schema.federationPeers)
+      .where(eq(schema.federationPeers.id, 'peer-auth-revoked')).get()!;
+    expect(row.status).toBe('revoked');
+  });
+});

@@ -1,0 +1,503 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import Fastify, { type FastifyInstance } from 'fastify';
+import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import * as schema from '../db/schema.js';
+import { eq } from 'drizzle-orm';
+import { setWorkerId } from './snowflake.js';
+
+// resolveOrCreateReplicatedUser (tested below) mints a snowflake for the new
+// stub row; the register route mints one for fresh accounts. Both throw if the
+// worker id is never initialised. Set it once at module load.
+setWorkerId(3);
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+type TestDb = ReturnType<typeof drizzle<typeof schema>>;
+let sqlite: Database.Database;
+let testDb: TestDb;
+
+const lookupCalls: Array<{ peerOrigin: string; homeUserId: string }> = [];
+const lookupResponses = new Map<string, unknown>();
+/** When set, the lookup is the real one, over a stubbed `fetch`. */
+let realLookup = false;
+
+vi.mock('../db/index.js', () => ({
+  getDb: () => testDb,
+  getRawDb: () => sqlite,
+  schema,
+}));
+
+vi.mock('./federationLookup.js', async (importActual) => {
+  const actual = await importActual<typeof import('./federationLookup.js')>();
+  return {
+    lookupRemoteUserByHomeId: vi.fn(async (peerOrigin: string, homeUserId: string) => {
+      lookupCalls.push({ peerOrigin, homeUserId });
+      if (realLookup) return actual.lookupRemoteUserByHomeId(peerOrigin, homeUserId);
+      const r = lookupResponses.get(homeUserId);
+      if (!r) return { ok: false, reason: 'not_found' };
+      return r;
+    }),
+  };
+});
+
+function applyMigrations(db: Database.Database): void {
+  const migrationsDir = path.resolve(__dirname, '../../drizzle');
+  const files = fs.readdirSync(migrationsDir).filter(f => f.endsWith('.sql')).sort();
+  for (const f of files) {
+    const sql = fs.readFileSync(path.join(migrationsDir, f), 'utf8');
+    for (const stmt of sql.split(/-->\s*statement-breakpoint/)) {
+      const clean = stmt.trim();
+      if (clean) db.exec(clean);
+    }
+  }
+}
+
+beforeEach(async () => {
+  sqlite = new Database(':memory:');
+  testDb = drizzle(sqlite, { schema });
+  applyMigrations(sqlite);
+  lookupCalls.length = 0;
+  lookupResponses.clear();
+  realLookup = false;
+  const { _resetHomeRecordPulls } = await import('./federationStubBackfill.js');
+  _resetHomeRecordPulls();
+  vi.unstubAllGlobals();
+  // Active peer
+  testDb.insert(schema.federationPeers).values({
+    id: 'peer-orbit',
+    origin: 'https://orbit.ddns.net',
+    hmacSecret: 'a'.repeat(64),
+    status: 'active',
+    createdAt: Date.now(),
+    lastSeenAt: Date.now(),
+  }).run();
+});
+
+describe('backfillStubUsernamesForPeer', () => {
+  it('rewrites snowflake-style username to realname when lookup succeeds', async () => {
+    // Seed legacy stub: username = `${homeUserId}@${domain}` (the old scheme)
+    testDb.insert(schema.users).values({
+      id: 'stub-1',
+      username: 'home-1@orbit.ddns.net',
+      displayName: null,
+      passwordHash: '!federation-replicated',
+      status: 'offline',
+      isAdmin: 0,
+      homeInstance: 'orbit.ddns.net',
+      homeUserId: 'home-1',
+      createdAt: Date.now(),
+    }).run();
+    lookupResponses.set('home-1', {
+      ok: true,
+      homeUserId: 'home-1',
+      username: 'pbtest3',
+      profile: { displayName: null, avatar: null, avatarColor: null, banner: null, bio: null },
+    });
+
+    const { backfillStubUsernamesForPeer } = await import('./federationStubBackfill.js');
+    await backfillStubUsernamesForPeer('https://orbit.ddns.net');
+
+    expect(lookupCalls).toEqual([{ peerOrigin: 'https://orbit.ddns.net', homeUserId: 'home-1' }]);
+    const row = testDb.select().from(schema.users).where(eq(schema.users.id, 'stub-1')).get();
+    expect(row!.username).toBe('pbtest3@orbit.ddns.net');
+    expect(row!.displayName).toBe('pbtest3'); // displayName ?? username fallback fills in real handle
+  });
+
+  it('skips stubs with their real name and a profile version (no lookup triggered)', async () => {
+    testDb.insert(schema.users).values({
+      id: 'stub-1',
+      username: 'pbtest3@orbit.ddns.net',  // already migrated
+      displayName: 'pbtest3',
+      passwordHash: '!federation-replicated',
+      status: 'offline',
+      isAdmin: 0,
+      homeInstance: 'orbit.ddns.net',
+      homeUserId: 'home-1',
+      profileUpdatedAt: 1000, // the home's profile already applied
+      createdAt: Date.now(),
+    }).run();
+
+    const { backfillStubUsernamesForPeer } = await import('./federationStubBackfill.js');
+    await backfillStubUsernamesForPeer('https://orbit.ddns.net');
+
+    expect(lookupCalls).toEqual([]); // no lookup triggered
+  });
+
+  it('leaves stub untouched on lookup miss (tombstoned home user)', async () => {
+    testDb.insert(schema.users).values({
+      id: 'stub-1',
+      username: 'unknown-id@orbit.ddns.net',
+      displayName: null,
+      passwordHash: '!federation-replicated',
+      status: 'offline',
+      isAdmin: 0,
+      homeInstance: 'orbit.ddns.net',
+      homeUserId: 'unknown-id',
+      createdAt: Date.now(),
+    }).run();
+    // No lookupResponses entry → mock returns { ok: false, reason: 'not_found' }
+
+    const { backfillStubUsernamesForPeer } = await import('./federationStubBackfill.js');
+    await backfillStubUsernamesForPeer('https://orbit.ddns.net');
+
+    const row = testDb.select().from(schema.users).where(eq(schema.users.id, 'stub-1')).get();
+    expect(row!.username).toBe('unknown-id@orbit.ddns.net'); // unchanged
+    expect(row!.displayName).toBeNull(); // unchanged
+  });
+
+  it('renames a stub named after a display name by an earlier call, from the home\'s answer', async () => {
+    testDb.insert(schema.users).values({
+      id: 'stub-1',
+      username: 'kai smith@orbit.ddns.net',
+      displayName: 'Kai Smith',
+      passwordHash: '!federation-replicated',
+      status: 'offline',
+      isAdmin: 0,
+      homeInstance: 'orbit.ddns.net',
+      homeUserId: '1234567890',
+      createdAt: Date.now(),
+    }).run();
+    lookupResponses.set('1234567890', {
+      ok: true,
+      homeUserId: '1234567890',
+      username: 'kai',
+      profile: { displayName: 'Kai Smith', avatar: null, avatarColor: null, banner: null, bio: null },
+    });
+
+    const { backfillStubUsernamesForPeer } = await import('./federationStubBackfill.js');
+    await backfillStubUsernamesForPeer('https://orbit.ddns.net');
+
+    expect(lookupCalls).toEqual([{ peerOrigin: 'https://orbit.ddns.net', homeUserId: '1234567890' }]);
+    const row = testDb.select().from(schema.users).where(eq(schema.users.id, 'stub-1')).get();
+    expect(row!.username).toBe('kai@orbit.ddns.net');
+    expect(row!.displayName).toBe('Kai Smith');
+  });
+
+  it('keeps asking about the other stubs when the home answers an HTTP error for one', async () => {
+    // The real lookup over a stubbed transport: the home refuses the first id
+    // with 403, which the lookup reports as unreachable instead of throwing,
+    // so the pass goes on to the second stub.
+    for (const [id, homeUserId] of [['stub-1', '111'], ['stub-2', '222']] as const) {
+      testDb.insert(schema.users).values({
+        id,
+        username: `${homeUserId}@orbit.ddns.net`,
+        displayName: null,
+        passwordHash: '!federation-replicated',
+        status: 'offline',
+        isAdmin: 0,
+        homeInstance: 'orbit.ddns.net',
+        homeUserId,
+        createdAt: Date.now(),
+      }).run();
+    }
+    realLookup = true;
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      const { homeUserId } = JSON.parse(String(init.body)) as { homeUserId: string };
+      if (homeUserId === '111') return new Response('forbidden', { status: 403 });
+      return new Response(JSON.stringify({
+        found: true,
+        user: {
+          homeUserId,
+          username: 'second',
+          profile: { displayName: null, avatar: null, avatarColor: null, banner: null, bio: null },
+        },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }));
+
+    const { backfillStubUsernamesForPeer } = await import('./federationStubBackfill.js');
+    await backfillStubUsernamesForPeer('https://orbit.ddns.net');
+
+    expect(lookupCalls.map(c => c.homeUserId)).toEqual(['111', '222']);
+    expect(testDb.select().from(schema.users).where(eq(schema.users.id, 'stub-1')).get()!.username).toBe('111@orbit.ddns.net');
+    expect(testDb.select().from(schema.users).where(eq(schema.users.id, 'stub-2')).get()!.username).toBe('second@orbit.ddns.net');
+  });
+
+  it('is a no-op when peer is not active', async () => {
+    testDb.update(schema.federationPeers)
+      .set({ status: 'unreachable' })
+      .where(eq(schema.federationPeers.id, 'peer-orbit'))
+      .run();
+    testDb.insert(schema.users).values({
+      id: 'stub-1',
+      username: 'home-1@orbit.ddns.net',
+      displayName: null,
+      passwordHash: '!federation-replicated',
+      status: 'offline',
+      isAdmin: 0,
+      homeInstance: 'orbit.ddns.net',
+      homeUserId: 'home-1',
+      createdAt: Date.now(),
+    }).run();
+    lookupResponses.set('home-1', {
+      ok: true,
+      homeUserId: 'home-1',
+      username: 'pbtest3',
+      profile: { displayName: null, avatar: null, avatarColor: null, banner: null, bio: null },
+    });
+
+    const { backfillStubUsernamesForPeer } = await import('./federationStubBackfill.js');
+    await backfillStubUsernamesForPeer('https://orbit.ddns.net');
+
+    expect(lookupCalls).toEqual([]); // gated on peer status
+  });
+});
+
+describe('backfillStubUsernamesForPeer: names from before 1.8 and profiles without a version', () => {
+  const DOMAIN = 'orbit.ddns.net';
+  const ORIGIN = 'https://orbit.ddns.net';
+
+  function seed(values: Partial<typeof schema.users.$inferInsert> & { id: string; username: string; homeUserId: string }): void {
+    testDb.insert(schema.users).values({
+      passwordHash: '!federation-replicated',
+      status: 'offline',
+      isAdmin: 0,
+      homeInstance: DOMAIN,
+      profileUpdatedAt: 1000,
+      createdAt: 1,
+      ...values,
+    }).run();
+  }
+
+  function answer(homeUserId: string, username: string, profile: Record<string, unknown> = {}): unknown {
+    return {
+      ok: true,
+      homeUserId,
+      username,
+      profile: { displayName: null, avatar: null, avatarColor: null, banner: null, bio: null, ...profile },
+    };
+  }
+
+  function nameOf(id: string): string {
+    return testDb.select().from(schema.users).where(eq(schema.users.id, id)).get()!.username;
+  }
+
+  async function runPass(): Promise<void> {
+    const { backfillStubUsernamesForPeer } = await import('./federationStubBackfill.js');
+    await backfillStubUsernamesForPeer(ORIGIN);
+  }
+
+  it('renames a replica an older version suffixed with _<n> to the handle its home reports', async () => {
+    seed({ id: 'r-1', username: `kai_1@${DOMAIN}`, homeUserId: '111' });
+    lookupResponses.set('111', answer('111', 'kai'));
+
+    await runPass();
+
+    expect(nameOf('r-1')).toBe(`kai@${DOMAIN}`);
+  });
+
+  it('an account an older re-attach suffixed takes its handle; a replica of another identity moves aside', async () => {
+    seed({ id: 'acc', username: `kai_1@${DOMAIN}`, homeUserId: '111', passwordHash: 'real-hash' });
+    seed({ id: 'stale', username: `kai@${DOMAIN}`, homeUserId: '999' });
+    lookupResponses.set('111', answer('111', 'kai'));
+    lookupResponses.set('999', { ok: false, reason: 'not_found' });
+
+    await runPass();
+
+    expect(nameOf('acc')).toBe(`kai@${DOMAIN}`);
+    expect(nameOf('stale')).toBe(`kai~1@${DOMAIN}`);
+  });
+
+  it('an account keeps its suffixed name while another account signs in with the handle', async () => {
+    seed({ id: 'acc', username: `kai_1@${DOMAIN}`, homeUserId: '111', passwordHash: 'real-hash' });
+    seed({ id: 'other', username: `kai@${DOMAIN}`, homeUserId: '999', passwordHash: 'other-hash' });
+    lookupResponses.set('111', answer('111', 'kai'));
+
+    await runPass();
+
+    expect(nameOf('acc')).toBe(`kai_1@${DOMAIN}`);
+    expect(nameOf('other')).toBe(`kai@${DOMAIN}`);
+  });
+
+  it('a real handle that looks suffixed stays, and is asked about once per process', async () => {
+    seed({ id: 'r-1', username: `kai_1@${DOMAIN}`, homeUserId: '111' });
+    lookupResponses.set('111', answer('111', 'kai_1'));
+
+    await runPass();
+    await runPass();
+
+    expect(nameOf('r-1')).toBe(`kai_1@${DOMAIN}`);
+    expect(lookupCalls.map(c => c.homeUserId)).toEqual(['111']);
+  });
+
+  it('a relayed hint never renames a _<n> row; only the home answer does', async () => {
+    seed({ id: 'r-1', username: `kai_1@${DOMAIN}`, homeUserId: '111' });
+    const { resolveOrCreateReplicatedUser } = await import('../routes/federation.js');
+
+    resolveOrCreateReplicatedUser('111', DOMAIN, testDb, { username: 'kai' });
+
+    expect(nameOf('r-1')).toBe(`kai_1@${DOMAIN}`);
+  });
+
+  it('a row without a profile version takes the home profile over what it holds', async () => {
+    seed({ id: 'r-1', username: `kai@${DOMAIN}`, homeUserId: '111', profileUpdatedAt: null, avatarColor: 'rose', displayName: 'Old' });
+    lookupResponses.set('111', answer('111', 'kai', { avatarColor: 'mint', displayName: 'Kai', profileUpdatedAt: 5000 }));
+
+    await runPass();
+
+    const stored = testDb.select().from(schema.users).where(eq(schema.users.id, 'r-1')).get()!;
+    expect(stored.avatarColor).toBe('mint');
+    expect(stored.displayName).toBe('Kai');
+    expect(stored.profileUpdatedAt).toBe(5000);
+  });
+
+  it('a row whose home answers without a version (1.7.0) is asked once per process', async () => {
+    seed({ id: 'r-1', username: `kai@${DOMAIN}`, homeUserId: '111', profileUpdatedAt: null });
+    lookupResponses.set('111', answer('111', 'kai', { displayName: 'Kai' }));
+
+    await runPass();
+    await runPass();
+
+    expect(lookupCalls.map(c => c.homeUserId)).toEqual(['111']);
+    const stored = testDb.select().from(schema.users).where(eq(schema.users.id, 'r-1')).get()!;
+    expect(stored.displayName).toBe('Kai');
+    expect(stored.profileUpdatedAt).toBeNull();
+
+    // A restart (the home may have upgraded meanwhile) asks again.
+    const { _resetHomeRecordPulls } = await import('./federationStubBackfill.js');
+    _resetHomeRecordPulls();
+    await runPass();
+    expect(lookupCalls.map(c => c.homeUserId)).toEqual(['111', '111']);
+  });
+
+  it('a pass started while one runs for the same peer joins it', async () => {
+    seed({ id: 'r-1', username: `ann@${DOMAIN}`, homeUserId: '111', profileUpdatedAt: null });
+    seed({ id: 'r-2', username: `ben@${DOMAIN}`, homeUserId: '222', profileUpdatedAt: null });
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const { lookupRemoteUserByHomeId } = await import('./federationLookup.js');
+    vi.mocked(lookupRemoteUserByHomeId).mockImplementationOnce(async (peerOrigin: string, homeUserId: string) => {
+      lookupCalls.push({ peerOrigin, homeUserId });
+      await gate;
+      return answer('111', 'ann', { profileUpdatedAt: 5000 }) as Awaited<ReturnType<typeof lookupRemoteUserByHomeId>>;
+    });
+    lookupResponses.set('222', answer('222', 'ben', { profileUpdatedAt: 5000 }));
+    const { backfillStubUsernamesForPeer } = await import('./federationStubBackfill.js');
+
+    const first = backfillStubUsernamesForPeer(ORIGIN);
+    const second = backfillStubUsernamesForPeer(ORIGIN);
+    release();
+    await Promise.all([first, second]);
+
+    expect(lookupCalls.map(c => c.homeUserId)).toEqual(['111', '222']);
+  });
+
+  it('stops at the first rate-limited answer', async () => {
+    seed({ id: 'r-1', username: `ann@${DOMAIN}`, homeUserId: '111', profileUpdatedAt: null });
+    seed({ id: 'r-2', username: `ben@${DOMAIN}`, homeUserId: '222', profileUpdatedAt: null });
+    lookupResponses.set('111', { ok: false, reason: 'rate_limited', retryAfter: 60 });
+    lookupResponses.set('222', answer('222', 'ben', { profileUpdatedAt: 5000 }));
+
+    await runPass();
+
+    expect(lookupCalls).toHaveLength(1);
+  });
+});
+
+describe('detached account: registration 409 + suffixed stub creation (detach spec §4.3.5)', () => {
+  // A detached account is a REAL federated user (homeInstance set, real bcrypt-style
+  // hash — NOT the '!federation-replicated' sentinel) whose home domain was reset
+  // and which has therefore been detached (federationHomeOrphaned = 1). Task 3's
+  // tier-2 exclusion makes it un-matchable via the domain+username heuristic, so a
+  // new same-name identity on the reset domain can neither register OVER the account
+  // (§4.3.5 → username-uniqueness 409) nor be BOUND to it by relay stub resolution
+  // (§4.3.4 → the collision guard suffixes a fresh stub instead).
+  const detachedId = 'detached-1';
+  const detachedUsername = 'alice@peer.example';
+  const originalHash = '$2b$10$abcdefghijklmnopqrstuv'; // real bcrypt-like hash, not a stub
+
+  function seedDetachedAccount(): void {
+    testDb.insert(schema.users).values({
+      id: detachedId,
+      username: detachedUsername,
+      displayName: null,
+      passwordHash: originalHash,
+      status: 'offline',
+      isAdmin: 0,
+      // Detached: homed here, its former identity kept aside.
+      homeInstance: null,
+      homeUserId: null,
+      detachedHomeInstance: 'peer.example',
+      detachedHomeUserId: 'old-home-uid',
+      federationHomeOrphaned: 1,
+      createdAt: Date.now(),
+    }).run();
+  }
+
+  function seedFederatedRegistrationOpen(): void {
+    // applyMigrations creates instance_settings but does not seed the id=1 row
+    // (production does so via migrate.ts:ensureDefaults). The register route reads
+    // federatedRegistrationOpen from it; without the row the federated path 403s.
+    testDb.insert(schema.instanceSettings).values({
+      id: 1,
+      registrationOpen: 1,
+      federatedRegistrationOpen: 1,
+      updatedAt: Date.now(),
+    }).run();
+  }
+
+  async function buildAuthApp(): Promise<FastifyInstance> {
+    const { authRoutes } = await import('../routes/auth.js');
+    const app = Fastify({ logger: false });
+    await app.register(authRoutes);
+    await app.ready();
+    return app;
+  }
+
+  it('federated registration of a same-name user on the reset domain returns 409, detached row untouched', async () => {
+    seedDetachedAccount();
+    seedFederatedRegistrationOpen();
+    const app = await buildAuthApp();
+    try {
+      // Fresh homeUserId + the reset domain replaying 'alice' as the handle. Tier-2
+      // no longer matches the detached row → the stub-upgrade branch is skipped →
+      // the plain username-uniqueness check on 'alice@peer.example' fires → 409.
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/auth/register',
+        payload: {
+          username: 'alice@peer.example',
+          password: 'password123',
+          homeInstance: 'peer.example',
+          homeUserId: 'new-home-uid',
+        },
+      });
+      expect(res.statusCode).toBe(409);
+    } finally {
+      await app.close();
+    }
+
+    const row = testDb.select().from(schema.users).where(eq(schema.users.id, detachedId)).get();
+    expect(row?.homeUserId).toBeNull();               // no backfill
+    expect(row?.homeInstance).toBeNull();             // still homed here
+    expect(row?.detachedHomeUserId).toBe('old-home-uid');
+    expect(row?.passwordHash).toBe(originalHash);     // no credential upgrade/re-hash
+    expect(row?.username).toBe(detachedUsername);      // handle not rebound
+    expect(row?.federationHomeOrphaned).toBe(1);       // still sovereign
+  });
+
+  it('relay stub resolution creates a SUFFIXED stub instead of binding to the detached row', async () => {
+    seedDetachedAccount();
+    const { resolveOrCreateReplicatedUser } = await import('../routes/federation.js');
+
+    // Fresh homeUserId → tier-1 miss; detached row is tier-2-excluded → no match.
+    // The collision guard finds 'alice@peer.example' already taken and suffixes.
+    const stub = resolveOrCreateReplicatedUser('new-home-uid', 'peer.example', testDb, { username: 'alice' });
+    expect(stub).not.toBeNull();
+    expect(stub!.id).not.toBe(detachedId);
+    expect(stub!.username).not.toBe(detachedUsername);
+    expect(stub!.passwordHash).toBe('!federation-replicated');
+    expect(stub!.homeUserId).toBe('new-home-uid');
+
+    // The detached account is left entirely untouched.
+    const row = testDb.select().from(schema.users).where(eq(schema.users.id, detachedId)).get();
+    expect(row?.username).toBe(detachedUsername);
+    expect(row?.homeUserId).toBeNull();
+    expect(row?.homeInstance).toBeNull();
+    expect(row?.detachedHomeUserId).toBe('old-home-uid');
+    expect(row?.passwordHash).toBe(originalHash);
+    expect(row?.federationHomeOrphaned).toBe(1);
+  });
+});
