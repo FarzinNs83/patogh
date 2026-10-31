@@ -20,55 +20,46 @@ The web app runs on http://127.0.0.1:5173 and the API on port 3005.
 Voice and video need a LiveKit server. Point `LIVEKIT_URL`, `LIVEKIT_API_KEY`
 and `LIVEKIT_API_SECRET` in `.env` at one (see `.env.example`).
 
-## install.sh
+## patogh-setup.sh
 
-Installs Patogh on a Linux server with Docker, behind nginx with a Let's
-Encrypt certificate, with voice and video (LiveKit):
+Installs Patogh on a Linux server (Ubuntu / Debian) with Docker, behind nginx
+with a Let's Encrypt certificate, with voice and video (LiveKit):
 
-- installs Docker and the compose plugin (from get.docker.com, or from the
-  distro packages if that is unreachable)
+- asks for the domain and checks that it points to the server
+- installs Docker and the compose plugin (from download.docker.com, or from
+  the distro packages if that is unreachable)
 - on a server in Iran, Docker Hub, npm and Debian are blocked: the script
   tests local mirrors on the spot and uses the ones that answer
-- asks only for the domain (point its DNS at the server first). With ports
-  80/443 free it runs the bundled nginx, gets the certificate and renews it
-  daily; when another reverse proxy already holds them it switches to proxy
-  mode and prints ready-to-paste config for nginx, Caddy and Traefik
-- generates the secrets and LiveKit keys once and keeps them on re-runs,
-  pulls the prebuilt image (or builds from source when it cannot) and checks
-  that `https://<domain>` answers
-
-Clone the repository on the server and run it from there:
+- clones the repository to `/opt/patogh`, generates the secrets and LiveKit
+  keys once (kept on re-runs), builds the image and starts it on 127.0.0.1
+- nginx on the host in front of it (websockets, `/livekit`), a Let's Encrypt
+  certificate that renews automatically, and a 2 GB swap file on servers with
+  less than 3 GB of RAM (for the build)
 
 ```bash
-git clone https://github.com/FarzinNs83/patogh.git
-cd patogh
-./install.sh
+bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/patogh/main/patogh-setup.sh)
 ```
 
-Then open `https://<domain>`: the first visitor names the server and becomes
-its owner. Re-running `install.sh` upgrades the install and keeps its settings.
+Then open `https://<domain>` right away: the first visitor names the server
+and becomes its owner.
+
+Update to the latest commit: run the same command again. It takes a database
+snapshot, pulls, rebuilds and restarts; settings and secrets are kept.
 
 Show all options:
 
 ```bash
-./install.sh --help
+bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/patogh/main/patogh-setup.sh) --help
 ```
 
-Ports: TCP 80/443, and for voice UDP 3478, TCP 7881 and UDP 50000-60000.
-
-## update.sh
-
-```bash
-./update.sh             # snapshot, pull the newest image, restart, verify
-./update.sh --check     # is there a newer release? changes nothing
-./update.sh --yes       # no confirmation (ssh, cron)
-```
-
-It takes a database snapshot first, restarts only the `patogh` container, waits
-until it is healthy and checks that the running version changed. If the new
-version does not come up, it puts the previous image back.
+Ports: TCP 80/443, and for voice UDP 3478, TCP 7881 and UDP 50000-60000 (open
+them in the provider firewall; `--open-firewall` opens them in ufw). Next to
+`dns-setup.sh` from my-scripts, Patogh sits behind its relay on
+`127.0.0.1:10446`.
 
 ## backup.sh / restore.sh
+
+From `/opt/patogh`:
 
 ```bash
 ./backup.sh                 # database snapshot to data/backups/
